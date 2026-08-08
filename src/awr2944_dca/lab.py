@@ -69,6 +69,39 @@ class RadarProject:
         from awr2944_dca._project import open_project_here
         return open_project_here()
 
+    @classmethod
+    def init(cls, path: 'str | Path' = ".") -> 'RadarProject':
+        """Idempotently initialize *path* as a RadarProject (\"git init\" semantics).
+
+        If the directory already contains a valid project (``awr2944.toml`` or
+        ``project.json``) it is opened and returned unchanged.  Otherwise the
+        standard scaffolding is created inside the existing directory without
+        touching any pre-existing files or data.
+
+        The directory **must already exist**; use :meth:`create` to create a
+        new project directory from scratch.
+
+        Raises:
+            FileNotFoundError: If *path* does not exist or is not a directory.
+            RuntimeError: If *path* looks like the awr2944-dca package source repo.
+        """
+        from pathlib import Path as _Path
+        from awr2944_dca._project import init_project_at
+        return init_project_at(_Path(path))
+
+    @classmethod
+    def init_here(cls) -> 'RadarProject':
+        """Idempotently initialize the *current working directory* as a RadarProject.
+
+        Equivalent to ``RadarProject.init(".")``.  Useful in Jupyter notebooks
+        where the working directory is already the experiment folder::
+
+            from awr2944_dca import RadarProject
+            p = RadarProject.init_here()
+        """
+        from awr2944_dca._project import init_project_here
+        return init_project_here()
+
     @property
     def config(self):
         return self._config

@@ -40,6 +40,202 @@ class DiscoveryReport:
     network_adapters: list[dict]
     timestamp: str
 
+    # ------------------------------------------------------------------
+    # Presentation
+    # ------------------------------------------------------------------
+
+    def print(self, filter: str | None = None) -> None:  # noqa: A002
+        """Print a formatted table to the terminal using Rich.
+
+        Args:
+            filter: Optional subset to print: ``"serial"`` / ``"com"`` for
+                    COM-port tables only, ``"network"`` for network only,
+                    ``None`` (default) for everything.
+        """
+        from rich.console import Console
+        from rich.table import Table
+        from rich import box as rbox
+
+        console = Console()
+        f = (filter or "").lower()
+        show_serial = f in ("", "serial", "com")
+        show_network = f in ("", "network")
+
+        console.print(
+            f"\n[bold cyan]Hardware Discovery Report[/bold cyan]  "
+            f"[dim]{self.timestamp}[/dim]"
+        )
+
+        if show_serial:
+            # ---- Serial / COM ports ----------------------------------------
+            t = Table(
+                title="Serial / COM Ports",
+                box=rbox.SIMPLE_HEAVY,
+                show_lines=False,
+                title_style="bold yellow",
+            )
+            t.add_column("Port", style="bold white", no_wrap=True)
+            t.add_column("Friendly Name", style="cyan")
+            t.add_column("VID:PID", style="magenta")
+            t.add_column("XDS110", justify="center")
+            t.add_column("Role", style="green")
+            t.add_column("Conf", justify="center")
+
+            for p in self.com_ports:
+                # com_ports are PortInfo (from hardware.ports.scan_ports)
+                vid_pid = ""
+                if hasattr(p, "hwid") and p.hwid:
+                    import re as _re
+                    m = _re.search(r"VID:PID=([0-9A-Fa-f:]+)", p.hwid)
+                    vid_pid = m.group(1) if m else ""
+                # XDS110 flag comes from serial_ports (SerialPortInfo)
+                xds_flag = ""
+                for sp in self.serial_ports:
+                    if hasattr(sp, "port") and sp.port == p.com:
+                        xds_flag = ":white_check_mark:" if sp.is_xds110 else ""
+                        break
+                t.add_row(
+                    p.com,
+                    getattr(p, "friendly_name", ""),
+                    vid_pid,
+                    xds_flag,
+                    getattr(p, "likely_role", ""),
+                    getattr(p, "confidence", ""),
+                )
+
+            if self.com_ports:
+                console.print(t)
+            else:
+                console.print("[dim]No serial / COM ports found.[/dim]")
+
+            # ---- XDS110 detail (from PnP discovery) ------------------------
+            xds_ports = [p for p in self.serial_ports if p.is_xds110]
+            if xds_ports:
+                xt = Table(
+                    title="XDS110 Ports (PnP)",
+                    box=rbox.SIMPLE_HEAVY,
+                    show_lines=False,
+                    title_style="bold yellow",
+                )
+                xt.add_column("Port", style="bold white", no_wrap=True)
+                xt.add_column("Friendly Name", style="cyan")
+                xt.add_column("VID", style="magenta")
+                xt.add_column("PID", style="magenta")
+                xt.add_column("Role", style="green")
+                xt.add_column("Status")
+                for xp in xds_ports:
+                    xt.add_row(
+                        xp.port, xp.name,
+                        getattr(xp, "vid", ""),
+                        getattr(xp, "pid", ""),
+                        getattr(xp, "role", ""),
+                        getattr(xp, "status", ""),
+                    )
+                console.print(xt)
+
+        if show_network:
+            # ---- Network adapters ------------------------------------------
+            nt = Table(
+                title="Network Adapters",
+                box=rbox.SIMPLE_HEAVY,
+                show_lines=False,
+                title_style="bold yellow",
+            )
+            nt.add_column("Interface Alias", style="bold white")
+            nt.add_column("IPv4 / Address", style="cyan")
+            nt.add_column("Prefix", justify="right")
+            nt.add_column("Family", justify="center")
+
+            for adapter in self.network_adapters:
+                family_raw = adapter.get("AddressFamily", "")
+                # AddressFamily: 2 = IPv4, 23 = IPv6, or string from PS
+                if isinstance(family_raw, int):
+                    family_str = "IPv4" if family_raw == 2 else ("IPv6" if family_raw == 23 else str(family_raw))
+                else:
+                    family_str = str(family_raw)
+                nt.add_row(
+                    adapter.get("InterfaceAlias", ""),
+                    adapter.get("IPAddress", ""),
+                    str(adapter.get("PrefixLength", "")),
+                    family_str,
+                )
+
+            if self.network_adapters:
+                console.print(nt)
+            else:
+                console.print("[dim]No network adapters found.[/dim]")
+
+    def __repr__(self) -> str:  # noqa: D105
+        n_serial = len(self.serial_ports)
+        n_com = len(self.com_ports)
+        n_net = len(self.network_adapters)
+        xds = sum(1 for p in self.serial_ports if p.is_xds110)
+        return (
+            f"DiscoveryReport("
+            f"serial={n_serial} [{xds} XDS110], "
+            f"com={n_com}, "
+            f"network={n_net}, "
+            f"ts={self.timestamp!r})"
+        )
+
+    def _repr_html_(self) -> str:
+        """Jupyter notebook HTML representation."""
+        rows_com = ""
+        for p in self.com_ports:
+            import re as _re
+            vid_pid = ""
+            if hasattr(p, "hwid") and p.hwid:
+                m = _re.search(r"VID:PID=([0-9A-Fa-f:]+)", p.hwid)
+                vid_pid = m.group(1) if m else ""
+            xds_mark = ""
+            for sp in self.serial_ports:
+                if hasattr(sp, "port") and sp.port == p.com:
+                    xds_mark = "&#10003;" if sp.is_xds110 else ""
+                    break
+            rows_com += (
+                f"<tr><td><b>{p.com}</b></td>"
+                f"<td>{getattr(p,'friendly_name','')}</td>"
+                f"<td><code>{vid_pid}</code></td>"
+                f"<td style='text-align:center'>{xds_mark}</td>"
+                f"<td>{getattr(p,'likely_role','')}</td>"
+                f"<td>{getattr(p,'confidence','')}</td></tr>"
+            )
+        if not rows_com:
+            rows_com = "<tr><td colspan='6'><i>none found</i></td></tr>"
+
+        rows_net = ""
+        for adapter in self.network_adapters:
+            family_raw = adapter.get("AddressFamily", "")
+            if isinstance(family_raw, int):
+                family_str = "IPv4" if family_raw == 2 else ("IPv6" if family_raw == 23 else str(family_raw))
+            else:
+                family_str = str(family_raw)
+            rows_net += (
+                f"<tr><td><b>{adapter.get('InterfaceAlias','')}</b></td>"
+                f"<td>{adapter.get('IPAddress','')}</td>"
+                f"<td>{adapter.get('PrefixLength','')}</td>"
+                f"<td>{family_str}</td></tr>"
+            )
+        if not rows_net:
+            rows_net = "<tr><td colspan='4'><i>none found</i></td></tr>"
+
+        style = "border-collapse:collapse;margin:8px 0"
+        th = "style='background:#333;color:#eee;padding:4px 8px;text-align:left'"
+        td = "style='padding:3px 8px;border-bottom:1px solid #555'"
+        return (
+            f"<details open><summary><b>DiscoveryReport</b> &mdash; {self.timestamp}</summary>"
+            f"<h4 style='margin:8px 0 2px'>Serial / COM Ports</h4>"
+            f"<table style='{style}'>"
+            f"<tr><th {th}>Port</th><th {th}>Friendly Name</th><th {th}>VID:PID</th>"
+            f"<th {th}>XDS110</th><th {th}>Role</th><th {th}>Conf</th></tr>"
+            f"{rows_com}</table>"
+            f"<h4 style='margin:8px 0 2px'>Network Adapters</h4>"
+            f"<table style='{style}'>"
+            f"<tr><th {th}>Interface Alias</th><th {th}>IP Address</th>"
+            f"<th {th}>Prefix</th><th {th}>Family</th></tr>"
+            f"{rows_net}</table></details>"
+        )
+
 
 @dataclass
 class HardwareReport:
@@ -126,23 +322,75 @@ class HardwareManager:
         self._checks[name] = res
         return res
 
-    def discover(self) -> DiscoveryReport:
-        from awr2944_dca.headless_serial import discover_serial_ports
-        from awr2944_dca.hardware.ports import scan_ports
-        from awr2944_dca.dca.preflight import _run_ps_json, _as_dicts
-        
-        sp = discover_serial_ports()
-        cp = scan_ports()
-        
-        script = "Get-NetIPAddress -ErrorAction SilentlyContinue | Select-Object InterfaceAlias, IPAddress, PrefixLength, AddressFamily"
-        net_adapters = _as_dicts(_run_ps_json(script))
-        
-        return DiscoveryReport(
+    def discover(self, filter: str | None = None) -> DiscoveryReport:  # noqa: A002
+        """Discover attached hardware (serial ports and network adapters).
+
+        Returns a :class:`DiscoveryReport`.  Call ``.print()`` on the result
+        for a formatted terminal view, or just let Jupyter display it via
+        ``_repr_html_()``.
+
+        Args:
+            filter: Optional subset to discover / display.
+                - ``None`` or omitted — all (serial + network) [default]
+                - ``"serial"`` or ``"com"`` — serial/COM ports only
+                - ``"network"`` — network adapters only
+
+        The underlying discovery calls are read-only and never mutate hardware.
+        """
+        f = (filter or "").lower()
+        if f not in ("", "serial", "com", "network"):
+            raise ValueError(
+                f"Unknown filter {filter!r}. "
+                "Valid values: None, 'serial', 'com', 'network'."
+            )
+
+        sp: list[Any] = []
+        cp: list[Any] = []
+        net_adapters: list[dict] = []
+
+        if f in ("", "serial", "com"):
+            try:
+                from awr2944_dca.headless_serial import discover_serial_ports
+                sp = discover_serial_ports()
+            except ImportError:
+                pass  # powershell-based, no extra deps
+
+            try:
+                from awr2944_dca.hardware.ports import scan_ports
+                cp = scan_ports()
+            except ImportError:
+                import warnings
+                warnings.warn(
+                    "pyserial is not installed; COM port scan unavailable. "
+                    "Install with: pip install awr2944-dca-lab[hardware]",
+                    stacklevel=2,
+                )
+            except RuntimeError as exc:
+                import warnings
+                warnings.warn(str(exc), stacklevel=2)
+
+        if f in ("", "network"):
+            try:
+                from awr2944_dca.dca.preflight import _run_ps_json, _as_dicts
+                script = (
+                    "Get-NetIPAddress -ErrorAction SilentlyContinue "
+                    "| Select-Object InterfaceAlias, IPAddress, PrefixLength, AddressFamily"
+                )
+                net_adapters = _as_dicts(_run_ps_json(script))
+            except Exception:
+                pass
+
+        report = DiscoveryReport(
             serial_ports=sp,
             com_ports=cp,
             network_adapters=net_adapters,
-            timestamp=datetime.now(timezone.utc).isoformat()
+            timestamp=datetime.now(timezone.utc).isoformat(),
         )
+        # Auto-print to terminal when called interactively (not in Jupyter)
+        # Users can suppress by not calling print() themselves; we print
+        # only when the caller didn't capture the return value — but Python
+        # can't detect that. Instead, just return and let callers decide.
+        return report
 
     def verify(self, include_hardware: bool = True) -> HardwareReport:
         self._checks.clear()
