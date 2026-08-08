@@ -25,6 +25,7 @@ from awr2944_dca._doctor import (
     ToolchainCandidate,
     _probe_uart_prompt,
     _scan_ti_toolchains,
+    _xds110_device_serial,
     _REQUIRED_TOOLCHAIN_FILES,
 )
 from awr2944_dca.lab import RadarProject
@@ -34,13 +35,32 @@ from awr2944_dca.lab import RadarProject
 # Helpers
 # ===========================================================================
 
-def _make_xds_port(com: str, role: str = "") -> SerialPortInfo:
+def _make_xds_port(
+    com: str,
+    role: str = "",
+    device_serial: str = "",
+    mi_suffix: str = "",
+) -> SerialPortInfo:
+    """Build a mock XDS110 SerialPortInfo.
+
+    Args:
+        com: COM port name, e.g. "COM3".
+        role: "application_user", "auxiliary_data", or "".
+        device_serial: Shared physical device serial for sibling ports, e.g. "ABC123".
+            If empty, a per-port unique id (the com name) is used.
+        mi_suffix: USB interface index suffix, e.g. "MI_00" or "MI_03".
+            Appended as ``&MI_xx`` when provided.
+    """
+    serial_part = device_serial or com
+    iid = f"USB\\VID_0451&PID_BEF3\\{serial_part}"
+    if mi_suffix:
+        iid = f"{iid}&{mi_suffix}"
     return SerialPortInfo(
         port=com,
-        name=f"XDS110 ... ({com})",
-        description=f"XDS110 ... ({com})",
+        name=f"XDS110 Class ... ({com})",
+        description=f"XDS110 Class ... ({com})",
         status="OK",
-        instance_id=f"USB\\VID_0451&PID_BEF3\\{com}",
+        instance_id=iid,
         vid="0451",
         pid="BEF3",
         is_xds110=True,
@@ -120,9 +140,16 @@ class TestAutodetectSerial:
     """S1–S10: autodetect_serial() scenarios."""
 
     def test_s1_com3_is_cli_com4_is_aux(self, tmp_path):
-        """S1: COM3 responds with prompt, COM4 does not → CLI=COM3, AUX=COM4."""
+        """S1: COM3 responds with prompt, COM4 does not → CLI=COM3, AUX=COM4.
+        
+        Ports are sibling interfaces of the same physical XDS110 device
+        (shared device serial DEV_A, MI_00 and MI_03).
+        """
         p = _make_project(tmp_path)
-        xds_ports = [_make_xds_port("COM3"), _make_xds_port("COM4")]
+        xds_ports = [
+            _make_xds_port("COM3", device_serial="DEV_A", mi_suffix="MI_00"),
+            _make_xds_port("COM4", device_serial="DEV_A", mi_suffix="MI_03"),
+        ]
 
         with (
             patch("awr2944_dca.headless_serial.discover_serial_ports", return_value=xds_ports),
@@ -135,13 +162,16 @@ class TestAutodetectSerial:
         assert result.aux_port == "COM4"
         assert result.verified is True
         assert result.saved is False
-        assert len(result.warnings) == 0
+        assert len(result.warnings) == 0, f"Unexpected warnings: {result.warnings}"
         assert len(result.candidates) == 2
 
     def test_s2_com4_is_cli_com3_is_aux(self, tmp_path):
         """S2: Reversed — COM4 responds, COM3 does not → CLI=COM4, AUX=COM3."""
         p = _make_project(tmp_path)
-        xds_ports = [_make_xds_port("COM3"), _make_xds_port("COM4")]
+        xds_ports = [
+            _make_xds_port("COM3", device_serial="DEV_A", mi_suffix="MI_00"),
+            _make_xds_port("COM4", device_serial="DEV_A", mi_suffix="MI_03"),
+        ]
 
         with (
             patch("awr2944_dca.headless_serial.discover_serial_ports", return_value=xds_ports),
@@ -157,7 +187,7 @@ class TestAutodetectSerial:
     def test_s3_unrelated_com_devices_never_probed(self, tmp_path):
         """S3: Unrelated COM devices (Arduino, power supply) must never be probed."""
         p = _make_project(tmp_path)
-        xds_ports = [_make_xds_port("COM3")]
+        xds_ports = [_make_xds_port("COM3", device_serial="DEV_A", mi_suffix="MI_00")]
         non_xds = [_make_non_xds_port("COM1"), _make_non_xds_port("COM7")]
         all_ports = non_xds + xds_ports  # discover_serial_ports returns all
 
@@ -234,7 +264,10 @@ class TestAutodetectSerial:
     def test_s7_multiple_prompt_responders_ambiguous(self, tmp_path):
         """S7: Two ports both respond → ambiguous, no CLI assigned, no guess."""
         p = _make_project(tmp_path)
-        xds_ports = [_make_xds_port("COM3"), _make_xds_port("COM4")]
+        xds_ports = [
+            _make_xds_port("COM3", device_serial="DEV_A", mi_suffix="MI_00"),
+            _make_xds_port("COM4", device_serial="DEV_A", mi_suffix="MI_03"),
+        ]
 
         with (
             patch("awr2944_dca.headless_serial.discover_serial_ports", return_value=xds_ports),
@@ -254,7 +287,10 @@ class TestAutodetectSerial:
         local_toml = tmp_path / "autodetect_test" / ".awr2944" / "local.toml"
         before = local_toml.read_bytes() if local_toml.exists() else b""
 
-        xds_ports = [_make_xds_port("COM3"), _make_xds_port("COM4")]
+        xds_ports = [
+            _make_xds_port("COM3", device_serial="DEV_A", mi_suffix="MI_00"),
+            _make_xds_port("COM4", device_serial="DEV_A", mi_suffix="MI_03"),
+        ]
         with (
             patch("awr2944_dca.headless_serial.discover_serial_ports", return_value=xds_ports),
             patch("awr2944_dca._doctor._probe_uart_prompt",
@@ -278,7 +314,10 @@ class TestAutodetectSerial:
         local_toml = project_root / ".awr2944" / "local.toml"
         before = tomllib.loads(local_toml.read_text(encoding="utf-8"))
 
-        xds_ports = [_make_xds_port("COM5"), _make_xds_port("COM6")]
+        xds_ports = [
+            _make_xds_port("COM5", device_serial="DEV_A", mi_suffix="MI_00"),
+            _make_xds_port("COM6", device_serial="DEV_A", mi_suffix="MI_03"),
+        ]
         with (
             patch("awr2944_dca.headless_serial.discover_serial_ports", return_value=xds_ports),
             patch("awr2944_dca._doctor._probe_uart_prompt",
@@ -348,6 +387,150 @@ class TestAutodetectSerial:
         ):
             result = p.hardware.autodetect_serial()
         result.print()  # must not raise
+
+
+# ===========================================================================
+# Multi-physical-device AUX ambiguity tests (Item 3 acceptance criterion)
+# ===========================================================================
+
+class TestAutodetectSerialMultiDevice:
+    """MD-1 to MD-4: AUX assignment with 2 physical XDS110 devices connected.
+
+    Two physical devices = four COM ports:
+        Device A: COM3 (MI_00 CLI), COM4 (MI_03 AUX)
+        Device B: COM5 (MI_00 CLI), COM6 (MI_03 AUX)
+    """
+
+    def _ports_two_devices(self):
+        """Four candidate ports from two distinct physical XDS110 devices."""
+        return [
+            _make_xds_port("COM3", device_serial="DEVA", mi_suffix="MI_00"),
+            _make_xds_port("COM4", device_serial="DEVA", mi_suffix="MI_03"),
+            _make_xds_port("COM5", device_serial="DEVB", mi_suffix="MI_00"),
+            _make_xds_port("COM6", device_serial="DEVB", mi_suffix="MI_03"),
+        ]
+
+    def test_md1_correct_sibling_selected_when_device_serial_known(self, tmp_path):
+        """MD-1: One CLI responder; sibling (same device serial) becomes AUX.
+
+        COM3 responds → CLI=COM3. COM4 is the sibling (DEVA&MI_03). COM5/COM6
+        are from a different physical device and must NOT be assigned as AUX.
+        """
+        p = _make_project(tmp_path)
+        xds_ports = self._ports_two_devices()
+
+        with (
+            patch("awr2944_dca.headless_serial.discover_serial_ports", return_value=xds_ports),
+            patch("awr2944_dca._doctor._probe_uart_prompt",
+                  side_effect=_probe_returns({"COM3": True, "COM4": False,
+                                              "COM5": False, "COM6": False})),
+        ):
+            result = p.hardware.autodetect_serial()
+
+        assert result.cli_port == "COM3", f"Expected CLI=COM3, got {result.cli_port!r}"
+        assert result.aux_port == "COM4", f"Expected AUX=COM4 (DEVA sibling), got {result.aux_port!r}"
+        assert result.verified is True
+        # A warning about non-sibling ports being ignored is acceptable
+        non_sibling_warning = any("other physical device" in w for w in result.warnings)
+        assert non_sibling_warning, (
+            "Expected a warning that non-sibling ports (COM5/COM6) were ignored, "
+            f"got: {result.warnings}"
+        )
+
+    def test_md2_aux_ambiguous_when_no_device_serial_info(self, tmp_path):
+        """MD-2: Without instance_id info, AUX is ambiguous for 2+ unverified ports.
+
+        Ports without &MI_xx (or with non-matching device serials) cannot be
+        safely matched as siblings. AUX must be empty, warning emitted.
+        """
+        p = _make_project(tmp_path)
+        # Ports without device serial → each gets its COM name as device serial
+        # → COM3 CLI device serial="COM3", COM4 device serial="COM4" → no match
+        xds_ports = [
+            _make_xds_port("COM3"),  # instance_id ends in \COM3 → dev_serial=COM3
+            _make_xds_port("COM4"),  # instance_id ends in \COM4 → dev_serial=COM4
+            _make_xds_port("COM5"),  # dev_serial=COM5
+        ]
+
+        with (
+            patch("awr2944_dca.headless_serial.discover_serial_ports", return_value=xds_ports),
+            patch("awr2944_dca._doctor._probe_uart_prompt",
+                  side_effect=_probe_returns({"COM3": True, "COM4": False, "COM5": False})),
+        ):
+            result = p.hardware.autodetect_serial()
+
+        assert result.cli_port == "COM3"
+        assert result.aux_port == "", f"AUX should be empty (ambiguous), got {result.aux_port!r}"
+        assert result.verified is True
+        assert len(result.warnings) > 0, "Expected a warning about unresolved AUX"
+
+    def test_md3_two_cli_responders_two_devices_remains_ambiguous(self, tmp_path):
+        """MD-3: Both Device A and Device B CLI ports respond → overall ambiguous."""
+        p = _make_project(tmp_path)
+        xds_ports = self._ports_two_devices()
+
+        with (
+            patch("awr2944_dca.headless_serial.discover_serial_ports", return_value=xds_ports),
+            patch("awr2944_dca._doctor._probe_uart_prompt",
+                  side_effect=_probe_returns({"COM3": True, "COM4": False,
+                                              "COM5": True, "COM6": False})),
+        ):
+            result = p.hardware.autodetect_serial()
+
+        assert result.cli_port == ""
+        assert result.aux_port == ""
+        assert result.verified is False
+        assert any("Ambiguous" in w or "Multiple" in w for w in result.warnings)
+
+    def test_md4_single_device_two_ports_unchanged(self, tmp_path):
+        """MD-4: Single physical XDS110 device (normal case) still works correctly.
+
+        Regression guard: the new sibling check must not break the common
+        one-device/two-port scenario.
+        """
+        p = _make_project(tmp_path)
+        xds_ports = [
+            _make_xds_port("COM3", device_serial="DEVA", mi_suffix="MI_00"),
+            _make_xds_port("COM4", device_serial="DEVA", mi_suffix="MI_03"),
+        ]
+
+        with (
+            patch("awr2944_dca.headless_serial.discover_serial_ports", return_value=xds_ports),
+            patch("awr2944_dca._doctor._probe_uart_prompt",
+                  side_effect=_probe_returns({"COM3": True, "COM4": False})),
+        ):
+            result = p.hardware.autodetect_serial()
+
+        assert result.cli_port == "COM3"
+        assert result.aux_port == "COM4"
+        assert result.verified is True
+        assert len(result.warnings) == 0, f"Unexpected warnings: {result.warnings}"
+
+
+class TestXds110DeviceSerial:
+    """Unit tests for the _xds110_device_serial() helper."""
+
+    def test_mi_suffix_stripped(self):
+        assert _xds110_device_serial(r"USB\VID_0451&PID_BEF3\ABC123&MI_00") == "ABC123"
+        assert _xds110_device_serial(r"USB\VID_0451&PID_BEF3\ABC123&MI_03") == "ABC123"
+
+    def test_no_mi_suffix_returns_whole_serial(self):
+        assert _xds110_device_serial(r"USB\VID_0451&PID_BEF3\ABC123") == "ABC123"
+
+    def test_empty_or_short_returns_empty(self):
+        assert _xds110_device_serial("") == ""
+        assert _xds110_device_serial(r"USB\VID_0451") == ""  # only 2 parts
+
+    def test_siblings_share_device_serial(self):
+        """Two sibling ports from the same XDS110 must return the same device serial."""
+        iid_cli = r"USB\VID_0451&PID_BEF3\DEVA&MI_00"
+        iid_aux = r"USB\VID_0451&PID_BEF3\DEVA&MI_03"
+        assert _xds110_device_serial(iid_cli) == _xds110_device_serial(iid_aux) == "DEVA"
+
+    def test_different_devices_produce_different_serials(self):
+        iid_a = r"USB\VID_0451&PID_BEF3\DEVA&MI_00"
+        iid_b = r"USB\VID_0451&PID_BEF3\DEVB&MI_00"
+        assert _xds110_device_serial(iid_a) != _xds110_device_serial(iid_b)
 
 
 # ===========================================================================
@@ -580,6 +763,124 @@ class TestAutodetectToolchain:
         with patch("awr2944_dca._doctor._scan_ti_toolchains", return_value=[cand_a, cand_b]):
             result = p.hardware.autodetect_toolchain()
         result.print()
+
+
+
+# ===========================================================================
+# cf.json validation target — Item 4 acceptance criterion
+# ===========================================================================
+
+class TestAutodetectToolchainCfJsonIsolation:
+    """Verify cf.json validation targets the discovered candidate, not local.toml."""
+
+    def test_validation_uses_candidate_cfjson_not_local_toml(self, tmp_path):
+        """T-CF1: save=False validates the candidate's cf.json regardless of
+        what local.toml currently stores in cf_json_path.
+
+        Setup:
+        - local.toml cf_json_path is blank (default project, never configured).
+        - A discovered candidate has a cf.json that DOES match the project network.
+        - autodetect_toolchain(save=False) must report cf_valid=True (validated
+          against the candidate file) and must NOT mutate local.toml.
+        """
+        p = _make_project(tmp_path)
+        cfg = p.config
+
+        # Confirm local.toml starts with blank cf_json_path
+        assert not cfg.local.cf_json_path, (
+            f"Expected blank cf_json_path in new project, got {cfg.local.cf_json_path!r}"
+        )
+
+        # Build a candidate whose cf.json matches the project network settings.
+        # Omit systemIPAddress if host_ip is blank (validator skips blank TOML fields).
+        cand = _make_toolchain_candidate(tmp_path, "03_01_04_04")
+        net_settings: dict = {
+            "DCA1000IPAddress": cfg.portable.dca_ip,
+            "DCA1000ConfigPort": cfg.portable.config_port,
+            "DCA1000DataPort": cfg.portable.data_port,
+        }
+        if cfg.local.host_ip:
+            net_settings["systemIPAddress"] = cfg.local.host_ip
+        valid_cf = {"DCA1000Config": {"ethernetConfigUpdate": net_settings}}
+        cand.cf_json.write_text(json.dumps(valid_cf))
+
+        local_toml_path = tmp_path / "autodetect_test" / ".awr2944" / "local.toml"
+        before_bytes = local_toml_path.read_bytes()
+
+        with patch("awr2944_dca._doctor._scan_ti_toolchains", return_value=[cand]):
+            result = p.hardware.autodetect_toolchain(save=False)
+
+        # cf.json belonging to the candidate must have been validated
+        assert result.selected is not None
+        assert result.cf_valid is True, (
+            f"Expected cf_valid=True from candidate file; got cf_detail={result.cf_detail!r}"
+        )
+
+        # local.toml must be byte-for-byte unchanged
+        after_bytes = local_toml_path.read_bytes()
+        assert before_bytes == after_bytes, "local.toml was mutated despite save=False"
+
+        # local.toml cf_json_path must still be blank
+        cfg_reload = p.config
+        assert not cfg_reload.local.cf_json_path, (
+            "cf_json_path must remain blank after save=False"
+        )
+
+    def test_validation_uses_candidate_cfjson_when_local_toml_points_elsewhere(self, tmp_path):
+        """T-CF2: save=False validates candidate cf.json even when local.toml
+        points to a DIFFERENT (non-matching) file.
+
+        The candidate's cf.json matches the project. The existing local.toml
+        cf_json_path points to a file with wrong network settings. Validation
+        must apply to the candidate file, returning cf_valid=True.
+        """
+        p = _make_project(tmp_path)
+        cfg = p.config
+
+        # Create a decoy file that does NOT match the project settings
+        decoy_dir = tmp_path / "decoy"
+        decoy_dir.mkdir()
+        decoy_cf = decoy_dir / "cf.json"
+        decoy_cf.write_text(json.dumps({
+            "DCA1000Config": {"ethernetConfigUpdate": {
+                "systemIPAddress": "10.0.0.99",
+                "DCA1000IPAddress": "10.0.0.1",
+                "DCA1000ConfigPort": 9999,
+                "DCA1000DataPort": 9998,
+            }}
+        }))
+        # Pre-set local.toml to point at the decoy
+        cfg.local.cf_json_path = str(decoy_cf)
+        cfg.save()
+
+        # Candidate's cf.json correctly matches the project
+        cand = _make_toolchain_candidate(tmp_path, "03_01_04_04")
+        net_settings: dict = {
+            "DCA1000IPAddress": cfg.portable.dca_ip,
+            "DCA1000ConfigPort": cfg.portable.config_port,
+            "DCA1000DataPort": cfg.portable.data_port,
+        }
+        if cfg.local.host_ip:
+            net_settings["systemIPAddress"] = cfg.local.host_ip
+        valid_cf = {"DCA1000Config": {"ethernetConfigUpdate": net_settings}}
+        cand.cf_json.write_text(json.dumps(valid_cf))
+
+        local_toml_path = tmp_path / "autodetect_test" / ".awr2944" / "local.toml"
+        before_bytes = local_toml_path.read_bytes()
+
+        with patch("awr2944_dca._doctor._scan_ti_toolchains", return_value=[cand]):
+            result = p.hardware.autodetect_toolchain(save=False)
+
+        # Validation must have used the CANDIDATE's cf.json, not the decoy
+        assert result.cf_valid is True, (
+            f"Expected cf_valid=True from candidate file; got {result.cf_detail!r}"
+        )
+        assert result.selected is not None
+        assert result.saved is False
+
+        # local.toml unchanged (still points at decoy)
+        after_bytes = local_toml_path.read_bytes()
+        assert before_bytes == after_bytes, "local.toml was mutated despite save=False"
 
 
 # ===========================================================================

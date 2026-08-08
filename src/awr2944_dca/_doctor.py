@@ -363,6 +363,32 @@ def _scan_ti_toolchains(
     candidates.sort(key=lambda c: c.version_tag)
     return candidates
 
+
+def _xds110_device_serial(instance_id: str) -> str:
+    """Extract the physical XDS110 device serial from a PnP InstanceId string.
+
+    Windows PnP InstanceIds for XDS110 look like::
+
+        USB\\VID_0451&PID_BEF3\\<device_serial>&MI_00
+        USB\\VID_0451&PID_BEF3\\<device_serial>&MI_03
+
+    The two sibling COM ports (Application/User and Auxiliary) of the SAME
+    physical XDS110 share the same ``<device_serial>`` component and differ
+    only in their ``MI_xx`` interface index suffix.
+
+    Returns the device serial string, or ``""`` if the InstanceId format is
+    not recognisable.
+    """
+    # Split on backslash; the serial+MI part is the 3rd component
+    parts = instance_id.replace("/", "\\").split("\\")
+    if len(parts) < 3:
+        return ""
+    serial_mi = parts[2]  # e.g. "ABC123&MI_00" or "ABC123" (no MI suffix)
+    # Strip the &MI_xx interface suffix if present
+    amp_idx = serial_mi.find("&")
+    return serial_mi[:amp_idx] if amp_idx >= 0 else serial_mi
+
+
 @dataclass
 class CheckResult:
     name: str
@@ -1038,8 +1064,10 @@ class HardwareManager:
            COM ports such as Arduinos, power supplies, or lab instruments.
         4. Each candidate is probed with a single ``\\n`` byte; if the SDK
            demo prompt ``mmwDemo:/>`` is returned, that port is the CLI.
-        5. If exactly one candidate is unverified after step 4, it is
-           inferred as the Auxiliary UART.
+        5. If exactly one unverified XDS110 port is identified as a physical
+           sibling of the CLI port (same device serial in PnP InstanceId),
+           it is assigned as the Auxiliary UART.  If no sibling can be
+           unambiguously identified, AUX is left empty and a warning is emitted.
 
         Args:
             save: If ``True`` and exactly one CLI port is verified, write
@@ -1102,14 +1130,51 @@ class HardwareManager:
         if len(verified_cli) == 1:
             cli_port, cli_detail = verified_cli[0]
             verified = True
-            # Infer AUX: the single remaining unverified XDS110 port
-            if len(unverified) == 1:
+
+            # Infer AUX using physical-device identity:
+            # Two XDS110 COM ports from the SAME physical device share the
+            # device serial suffix in their InstanceId, e.g.:
+            #   USB\VID_0451&PID_BEF3\<device_serial>&MI_00
+            #   USB\VID_0451&PID_BEF3\<device_serial>&MI_03
+            # We must NOT assign an unverified port from a *different* device.
+            cli_sp = next((s for s in xds_candidates if s.port == cli_port), None)
+            cli_dev_serial = _xds110_device_serial(cli_sp.instance_id) if cli_sp else ""
+
+            # Collect unverified ports that are siblings of the CLI device
+            sibling_unverified: list[str] = []
+            non_sibling_unverified: list[str] = []
+            for port in unverified:
+                sp = next((s for s in xds_candidates if s.port == port), None)
+                dev_serial = _xds110_device_serial(sp.instance_id) if sp else ""
+                if cli_dev_serial and dev_serial and dev_serial == cli_dev_serial:
+                    sibling_unverified.append(port)
+                else:
+                    # Either no instance_id info, or from a different physical device
+                    non_sibling_unverified.append(port)
+
+            if len(sibling_unverified) == 1:
+                aux_port = sibling_unverified[0]
+                if non_sibling_unverified:
+                    warnings.append(
+                        f"Additional XDS110 port(s) from other physical device(s) "
+                        f"ignored for AUX: {non_sibling_unverified}"
+                    )
+            elif len(sibling_unverified) == 0 and len(unverified) == 1 and not cli_dev_serial:
+                # Fallback: no instance_id info available for either port,
+                # single unverified candidate — accept it (original behavior).
                 aux_port = unverified[0]
-            elif len(unverified) > 1:
+            elif len(sibling_unverified) > 1:
                 warnings.append(
-                    f"Multiple unverified XDS110 ports remain; "
-                    f"cannot unambiguously assign AUX: {unverified}"
+                    f"Multiple sibling XDS110 ports for AUX; "
+                    f"cannot unambiguously assign: {sibling_unverified}"
                 )
+            elif len(unverified) > 0 and not aux_port:
+                warnings.append(
+                    f"Cannot unambiguously assign AUX — {len(unverified)} unverified "
+                    f"XDS110 port(s) but none confirmed as sibling of CLI {cli_port}: "
+                    f"{unverified}"
+                )
+
         elif len(verified_cli) == 0:
             if unverified:
                 warnings.append(
@@ -1126,6 +1191,7 @@ class HardwareManager:
                 "Cannot unambiguously assign CLI port."
             )
             cli_detail = f"Ambiguous: {ports_str}"
+
 
         # Save
         saved = False
