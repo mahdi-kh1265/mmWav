@@ -565,50 +565,222 @@ class RadarCapture:
         return f"<div style='font-family: monospace; padding: 8px; border: 1px solid #444; border-radius: 4px; background: #1a1a2e; color: #e0e0e0;'><h3 style='margin: 0 0 8px;'>📡 {m.get('capture_name', self._capture_id)}</h3><p>ID: <code>{self._capture_id}</code> · Status: <span style='color: {status_color};'>{status}</span> · Created: {m.get('created_at', '')}</p>{(f'<p>Tags: {tags_html}</p>' if tags_html else '')}</div>"
 
 class EthernetManager:
-    """Notebook-facing Ethernet pairing manager.
+    """Notebook-facing Ethernet manager.
 
-    Access via ``lab.eth``.
+    Access via ``p.eth``.
+
+    Normal read-only workflow::
+
+        p.eth.status()        # what is the Ethernet readiness state?
+        p.eth.instructions()  # how do I configure a dedicated DCA NIC?
+
+    The methods above **never mutate Windows networking**.  For the
+    one-time manual NIC setup, follow the instructions printed by
+    ``p.eth.instructions()``.
+
+    Low-level pairing helpers (``pair()``, ``configure()``, ``repair()``)
+    are preserved for advanced/development use.  They may mutate NIC
+    settings when ``apply=True`` / ``dry_run=False``.
     """
 
-    def __init__(self, project: RadarProject):
+    def __init__(self, project: RadarProject, _snapshot_fn=None):
         self._project = project
         self._root = project._root
+        # _snapshot_fn is injectable for tests; None → real PowerShell call
+        self._snapshot_fn = _snapshot_fn
+
+    # ------------------------------------------------------------------
+    # READ-ONLY PUBLIC API (Parts B, C, D)
+    # ------------------------------------------------------------------
+
+    def status(self, *, _snapshot_fn=None) -> 'EthernetStatusResult':
+        """Return a typed read-only DCA Ethernet status snapshot.
+
+        Queries the live Windows network state (read-only PowerShell
+        commands) and compares it with the project's expected host IP
+        and DCA network settings.
+
+        Returns
+        -------
+        EthernetStatusResult
+            Includes adapter candidates ranked by DCA suitability,
+            overall readiness, and any warnings.  Never mutates NIC
+            settings.
+
+        Example::
+
+            st = p.eth.status()
+            st.print()     # terminal output
+            st             # Jupyter HTML
+        """
+        from awr2944_dca.api._eth_status import build_eth_status
+        raw = self._fetch_raw_adapters(_snapshot_fn)
+        return build_eth_status(self._project.config, raw)
+
+    def instructions(self, *, prefix_length: int = 24, _snapshot_fn=None) -> 'EthernetInstructionsResult':
+        """Return manual DCA NIC setup instructions (read-only).
+
+        Explains exactly how to configure the dedicated Ethernet adapter
+        in Windows to match the project's expected host IP and DCA
+        network settings.  No PowerShell mutation commands are issued.
+
+        Example::
+
+            p.eth.instructions().print()
+        """
+        from awr2944_dca.api._eth_status import build_eth_status, build_eth_instructions
+        raw = self._fetch_raw_adapters(_snapshot_fn)
+        st  = build_eth_status(self._project.config, raw)
+        return build_eth_instructions(self._project.config, st, prefix_length=prefix_length)
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _fetch_raw_adapters(self, override_fn=None) -> list:
+        """Return raw adapter dicts from PowerShell (or injected fn for tests)."""
+        fn = override_fn or self._snapshot_fn
+        if fn is not None:
+            return fn()
+        try:
+            from awr2944_dca.dca.preflight import _run_ps_json, _as_dicts
+            # --- adapter metadata ---
+            adp_script = (
+                "Get-NetAdapter -ErrorAction SilentlyContinue "
+                "| Select-Object Name, InterfaceDescription, Status, MacAddress, MediaType"
+            )
+            adp_rows = _as_dicts(_run_ps_json(adp_script))
+            adp_by_alias: dict = {}
+            for row in adp_rows:
+                alias = row.get("Name", "")
+                if alias:
+                    adp_by_alias[alias] = {
+                        "_Description": row.get("InterfaceDescription", ""),
+                        "_Status":      row.get("Status", ""),
+                        "_MacAddress":  row.get("MacAddress", ""),
+                        "media_type":   row.get("MediaType", ""),
+                    }
+
+            # --- IPv4 addresses ---
+            ip_script = (
+                "Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue "
+                "| Select-Object InterfaceAlias, IPAddress, PrefixLength, AddressFamily"
+            )
+            ip_rows = _as_dicts(_run_ps_json(ip_script))
+
+            # --- default-gateway flags ---
+            gw_script = (
+                "Get-NetRoute -DestinationPrefix '0.0.0.0/0' "
+                "-ErrorAction SilentlyContinue | Select-Object InterfaceAlias"
+            )
+            gw_rows  = _as_dicts(_run_ps_json(gw_script))
+            gw_aliases: set = {
+                r.get("InterfaceAlias", "") for r in gw_rows if r.get("InterfaceAlias")
+            }
+
+            # Merge metadata into IP rows
+            for row in ip_rows:
+                alias = row.get("InterfaceAlias", "")
+                row.update(adp_by_alias.get(alias, {}))
+                row["_has_gateway"] = alias in gw_aliases
+
+            # Also add adapters that have no IPv4 at all (disconnected, etc.)
+            ip_aliases = {r.get("InterfaceAlias", "") for r in ip_rows}
+            for alias, meta in adp_by_alias.items():
+                if alias not in ip_aliases:
+                    ip_rows.append({
+                        "InterfaceAlias": alias,
+                        "IPAddress": "",
+                        "PrefixLength": 0,
+                        "AddressFamily": 2,
+                        "_has_gateway": alias in gw_aliases,
+                        **meta,
+                    })
+
+            return ip_rows
+        except Exception:
+            return []
+
+    # ------------------------------------------------------------------
+    # LEGACY PAIRING HELPERS (low-level, preserved for advanced use)
+    # ------------------------------------------------------------------
 
     def snapshot(self) -> 'Any':
-        """Take a network adapter snapshot."""
+        """Take a network adapter snapshot (low-level)."""
         from awr2944_dca import eth as eth_mod
         return eth_mod.take_snapshot()
 
     def begin_pairing(self, snapshot_fn=None) -> 'Any':
         """Step 1: Take a 'before' snapshot (before plugging in DCA).
 
-        Returns a PairingSession to pass to finish_pairing().
+        Returns a PairingSession to pass to ``finish_pairing()``.
         """
         from awr2944_dca import eth as eth_mod
         return eth_mod.begin_pairing(snapshot_fn=snapshot_fn)
 
-    def finish_pairing(self, session, *, force: bool=False, apply: bool=False, snapshot_fn=None, apply_fn=None) -> dict:
+    def finish_pairing(
+        self,
+        session,
+        *,
+        force: bool = False,
+        apply: bool = False,
+        snapshot_fn=None,
+        apply_fn=None,
+    ) -> dict:
         """Step 2: Take 'after' snapshot and detect DCA adapter.
+
+        Advanced/unsafe: when ``apply=True`` this will issue PowerShell
+        commands that may replace IPv4, default-route, and DNS settings
+        on the selected interface.  Normal users should configure a
+        dedicated DCA NIC manually and use ``p.eth.status()`` /
+        ``p.eth.instructions()`` / ``p.doctor()``.
 
         Args:
             session: PairingSession from begin_pairing().
-            force: Allow gateway adapters.
-            apply: If True, configure the adapter now (default: dry-run).
+            force: Allow gateway adapters (dangerous).
+            apply: If True, configure the adapter now.
         """
         from awr2944_dca import eth as eth_mod
         from awr2944_dca.project import get_dca_profile
         profile = get_dca_profile(self._root)
-        return eth_mod.finish_pairing(session, self._root, host_ip=profile['host_ip'], prefix_length=profile['prefix_length'], force=force, apply=apply, snapshot_fn=snapshot_fn, apply_fn=apply_fn)
+        return eth_mod.finish_pairing(
+            session, self._root,
+            host_ip=profile['host_ip'],
+            prefix_length=profile['prefix_length'],
+            force=force, apply=apply,
+            snapshot_fn=snapshot_fn, apply_fn=apply_fn,
+        )
 
-    def pair(self, *, force: bool=False, apply: bool=False) -> dict:
-        """Convenience: interactive pairing (begin + prompt + finish)."""
+    def pair(self, *, force: bool = False, apply: bool = False) -> dict:
+        """Convenience: interactive pairing (begin + prompt + finish).
+
+        Advanced/unsafe: calls ``finish_pairing(apply=apply)``.
+        Normal users should follow ``p.eth.instructions()`` instead.
+        """
         from awr2944_dca import eth as eth_mod
         session = self.begin_pairing()
-        input('🔌 Unplug all non-essential Ethernet cables, then plug in the DCA1000 Ethernet cable.\nPress Enter when ready...')
+        input(
+            '\U0001f50c Unplug all non-essential Ethernet cables, '
+            'then plug in the DCA1000 Ethernet cable.\nPress Enter when ready...'
+        )
         return self.finish_pairing(session, force=force, apply=apply)
 
-    def status(self) -> dict:
-        """Check current Ethernet pairing status."""
+    def ensure_ready(self) -> dict:
+        """Validate saved pairing. Raises if not ready."""
+        st_legacy = self._legacy_status()
+        if not st_legacy.get('paired'):
+            raise ValueError('No Ethernet pairing configured. Run lab.eth.pair() first.')
+        if not st_legacy.get('ready'):
+            raise ValueError(
+                f"DCA Ethernet not ready: adapter '{st_legacy.get('interface_alias')}' "
+                f"status={st_legacy.get('status')}, "
+                f"has_correct_ip={st_legacy.get('has_correct_ip')}. "
+                "Run lab.eth.repair() to fix."
+            )
+        return st_legacy
+
+    def _legacy_status(self) -> dict:
+        """Legacy dict-style status (used by ensure_ready / old code)."""
         from awr2944_dca import eth as eth_mod
         pairing = eth_mod.load_pairing(self._root)
         if pairing is None:
@@ -616,19 +788,22 @@ class EthernetManager:
         from awr2944_dca.project import get_dca_profile
         profile = get_dca_profile(self._root)
         adapter_status = eth_mod.check_adapter_status(pairing, host_ip=profile['host_ip'])
-        return {'paired': True, 'interface_alias': pairing.interface_alias, 'interface_index': pairing.interface_index, 'host_adapter_mac': pairing.host_adapter_mac, 'paired_at': pairing.paired_at, **adapter_status}
+        return {
+            'paired': True,
+            'interface_alias': pairing.interface_alias,
+            'interface_index': pairing.interface_index,
+            'host_adapter_mac': pairing.host_adapter_mac,
+            'paired_at': pairing.paired_at,
+            **adapter_status,
+        }
 
-    def ensure_ready(self) -> dict:
-        """Validate saved pairing. Raises if not ready."""
-        st = self.status()
-        if not st.get('paired'):
-            raise ValueError('No Ethernet pairing configured. Run lab.eth.pair() first.')
-        if not st.get('ready'):
-            raise ValueError(f"DCA Ethernet not ready: adapter '{st.get('interface_alias')}' status={st.get('status')}, has_correct_ip={st.get('has_correct_ip')}. Run lab.eth.repair() to fix.")
-        return st
-
-    def configure(self, dry_run: bool=True) -> dict:
+    def configure(self, dry_run: bool = True) -> dict:
         """Apply saved pairing configuration.
+
+        Advanced/unsafe: when ``dry_run=False`` this issues PowerShell
+        commands that may replace IPv4, default-route, and DNS settings
+        on the paired interface.  Normal users should configure a
+        dedicated DCA NIC manually using ``p.eth.instructions()``.
 
         Args:
             dry_run: If True (default), return commands without executing.
@@ -637,10 +812,17 @@ class EthernetManager:
         pairing = eth_mod.load_pairing(self._root)
         if pairing is None:
             raise ValueError('No Ethernet pairing configured.')
-        adapter = eth_mod.AdapterInfo(interface_alias=pairing.interface_alias, interface_index=pairing.interface_index, status='Up', link_speed='', mac_address=pairing.host_adapter_mac)
+        adapter = eth_mod.AdapterInfo(
+            interface_alias=pairing.interface_alias,
+            interface_index=pairing.interface_index,
+            status='Up', link_speed='',
+            mac_address=pairing.host_adapter_mac,
+        )
         from awr2944_dca.project import get_dca_profile
         profile = get_dca_profile(self._root)
-        commands = eth_mod.build_configure_commands(adapter, host_ip=profile['host_ip'], prefix_length=profile['prefix_length'])
+        commands = eth_mod.build_configure_commands(
+            adapter, host_ip=profile['host_ip'], prefix_length=profile['prefix_length']
+        )
         result = {'commands': commands, 'applied': False}
         if not dry_run:
             apply_results = eth_mod.apply_configuration(commands)
@@ -649,7 +831,12 @@ class EthernetManager:
         return result
 
     def repair(self) -> dict:
-        """Re-apply saved pairing config (dry_run=False)."""
+        """Re-apply saved pairing config (dry_run=False).
+
+        Advanced/unsafe: replaces IPv4/route/DNS on the paired interface.
+        Normal users should configure a dedicated DCA NIC manually and
+        use ``p.eth.status()`` / ``p.doctor()`` to verify.
+        """
         return self.configure(dry_run=False)
 
     def unpair(self) -> None:
@@ -659,7 +846,10 @@ class EthernetManager:
 
     def restore_last_snapshot(self) -> dict:
         """Restore pre-pairing IP config (not yet implemented)."""
-        raise NotImplementedError('restore_last_snapshot requires the pre-pairing snapshot to be replayed. This feature will be added in a future phase.')
+        raise NotImplementedError(
+            'restore_last_snapshot requires the pre-pairing snapshot to be replayed. '
+            'This feature will be added in a future phase.'
+        )
 
 class CaptureApi:
     """Production capture API delegating to capture_session."""

@@ -992,20 +992,112 @@ class HardwareManager:
                 else:
                     self._add("uart_prompt_responds", "FAIL", "DIAGNOSTIC_HARDWARE_ACCESS", detail)
 
-        # 12. Host NIC owns IP
+        # 12. Host NIC owns IP — with actionable candidate detail
         host_ip = cfg.local.host_ip
         if not host_ip:
-            self._add("host_nic_owns_ip", "FAIL", "DIAGNOSTIC_HARDWARE_ACCESS", "Not configured")
+            self._add(
+                "host_nic_owns_ip", "FAIL", "DIAGNOSTIC_HARDWARE_ACCESS",
+                "host_ip not configured. "
+                "Run p.hardware.autodetect_serial(save=True) or edit .awr2944/local.toml."
+            )
         else:
-            from awr2944_dca.dca.preflight import run_dca_preflight
-            pf = run_dca_preflight(host_ip=host_ip, dca_ip=cfg.portable.dca_ip, ping_only=True)
             from awr2944_dca.dca.preflight import _run_ps_json, _as_dicts
-            script = f"Get-NetIPAddress -IPAddress {host_ip} -ErrorAction SilentlyContinue | Select-Object InterfaceAlias"
+            script = (
+                f"Get-NetIPAddress -IPAddress '{host_ip}' "
+                "-ErrorAction SilentlyContinue | Select-Object InterfaceAlias"
+            )
             found = _as_dicts(_run_ps_json(script))
             if found:
-                self._add("host_nic_owns_ip", "PASS", "DIAGNOSTIC_HARDWARE_ACCESS", f"Bound to {found[0].get('InterfaceAlias', 'Unknown')}")
+                self._add(
+                    "host_nic_owns_ip", "PASS", "DIAGNOSTIC_HARDWARE_ACCESS",
+                    f"Bound to {found[0].get('InterfaceAlias', 'Unknown')}"
+                )
             else:
-                self._add("host_nic_owns_ip", "FAIL", "DIAGNOSTIC_HARDWARE_ACCESS", f"{host_ip} not found on any local interface")
+                # Build actionable candidate detail using the same ranking logic
+                detail_lines = [f"{host_ip} not found on any local interface."]
+                try:
+                    from awr2944_dca.api._eth_status import rank_adapter_candidates, pick_recommended, CONF_UNSAFE
+                    # Gather raw adapter data
+                    adp_script = (
+                        "Get-NetAdapter -ErrorAction SilentlyContinue "
+                        "| Select-Object Name, InterfaceDescription, Status, MacAddress"
+                    )
+                    adp_rows = _as_dicts(_run_ps_json(adp_script))
+                    adp_by_alias: dict = {}
+                    for row in adp_rows:
+                        alias = row.get("Name", "")
+                        if alias:
+                            adp_by_alias[alias] = {
+                                "_Description": row.get("InterfaceDescription", ""),
+                                "_Status":      row.get("Status", ""),
+                                "_MacAddress":  row.get("MacAddress", ""),
+                            }
+                    ip_script = (
+                        "Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue "
+                        "| Select-Object InterfaceAlias, IPAddress, PrefixLength, AddressFamily"
+                    )
+                    ip_rows = _as_dicts(_run_ps_json(ip_script))
+                    gw_script = (
+                        "Get-NetRoute -DestinationPrefix '0.0.0.0/0' "
+                        "-ErrorAction SilentlyContinue | Select-Object InterfaceAlias"
+                    )
+                    gw_rows  = _as_dicts(_run_ps_json(gw_script))
+                    gw_set   = {r.get("InterfaceAlias", "") for r in gw_rows}
+                    for row in ip_rows:
+                        al = row.get("InterfaceAlias", "")
+                        row.update(adp_by_alias.get(al, {}))
+                        row["_has_gateway"] = al in gw_set
+                    candidates = rank_adapter_candidates(ip_rows, host_ip)
+                    rec, ambiguous = pick_recommended(candidates)
+
+                    if rec:
+                        cur_ips = (
+                            ", ".join(
+                                f"{ip}/{pl}" for ip, pl in
+                                zip(rec.ipv4_addresses, rec.prefix_lengths)
+                            ) or "(no IPv4)"
+                        )
+                        detail_lines += [
+                            f"Likely dedicated DCA adapter:",
+                            f"  Alias:    {rec.alias}",
+                            f"  Desc:     {rec.description or '(unknown)'}",
+                            f"  Current:  {cur_ips}",
+                            f"  Gateway:  {'yes' if rec.has_gateway else 'no'}",
+                            f"Configure that adapter manually:",
+                            f"  {host_ip} /24  (gateway blank, DNS blank)",
+                            f"  See p.eth.instructions() for full guidance.",
+                        ]
+                    elif ambiguous:
+                        gw_free = [c for c in candidates if not c.has_gateway and c.link_state.lower() == "up"]
+                        plausible_aliases = [c.alias for c in gw_free]
+                        detail_lines += [
+                            "Adapter selection is ambiguous.",
+                            "Plausible gateway-less adapters:",
+                        ] + [f"  - {a}" for a in plausible_aliases]
+                        detail_lines.append("See p.eth.instructions() for guidance.")
+                    else:
+                        # Check if only gateway-bearing adapters exist
+                        unsafe = [c for c in candidates if c.confidence == CONF_UNSAFE]
+                        if unsafe:
+                            detail_lines += [
+                                "WARNING: the only wired adapters found have default gateways "
+                                "(normal Internet connections). "
+                                "Do NOT assign the DCA host IP to these adapters.",
+                                "Use a dedicated USB-Ethernet adapter for DCA1000.",
+                            ]
+                        else:
+                            detail_lines.append(
+                                "No suitable dedicated adapter found. "
+                                "Connect a dedicated wired Ethernet adapter for DCA1000."
+                            )
+                    detail_lines.append("No network settings were changed.")
+                except Exception:
+                    detail_lines.append("(Could not enumerate adapters for candidate advice.)")
+
+                self._add(
+                    "host_nic_owns_ip", "FAIL", "DIAGNOSTIC_HARDWARE_ACCESS",
+                    "  ".join(detail_lines),
+                )
 
         # 14. UDP Data port bind
         if self._checks.get("host_nic_owns_ip", CheckResult("","FAIL","","")).status != "PASS":
@@ -1018,7 +1110,35 @@ class HardwareManager:
                 sock.close()
                 self._add("udp_data_port_bind", "PASS", "DIAGNOSTIC_HARDWARE_ACCESS", f"{host_ip}:{port} is available")
             except OSError as e:
-                self._add("udp_data_port_bind", "FAIL", "DIAGNOSTIC_HARDWARE_ACCESS", f"BUSY - Cannot bind {host_ip}:{port} ({e})")
+                err_str = str(e)
+                # Distinguish port-in-use from other socket errors
+                if e.errno in (98, 10048) or "in use" in err_str.lower() or "address already" in err_str.lower():
+                    # Port already bound — try to find the owning PID (read-only)
+                    pid_detail = ""
+                    try:
+                        import subprocess as _sp
+                        res = _sp.run(
+                            ["powershell", "-NoProfile", "-Command",
+                             f"Get-NetUDPEndpoint -LocalAddress {host_ip} "
+                             f"-LocalPort {port} -ErrorAction SilentlyContinue "
+                             "| Select-Object -ExpandProperty OwningProcess"],
+                            capture_output=True, text=True, timeout=5,
+                            creationflags=getattr(_sp, "CREATE_NO_WINDOW", 0),
+                        )
+                        pid = res.stdout.strip()
+                        if pid.isdigit():
+                            pid_detail = f" (PID {pid} — stop that process or wait)"
+                    except Exception:
+                        pass
+                    self._add(
+                        "udp_data_port_bind", "FAIL", "DIAGNOSTIC_HARDWARE_ACCESS",
+                        f"UDP {host_ip}:{port} already in use{pid_detail}"
+                    )
+                else:
+                    self._add(
+                        "udp_data_port_bind", "FAIL", "DIAGNOSTIC_HARDWARE_ACCESS",
+                        f"Cannot bind {host_ip}:{port} — {err_str}"
+                    )
 
         # 13. DCA Control responds
         if (self._checks.get("dca_control_exe_exists", CheckResult("","FAIL","","")).status != "PASS" or 
