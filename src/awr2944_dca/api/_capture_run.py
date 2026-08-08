@@ -160,6 +160,35 @@ class FacadeCaptureApi:
             connection_overrides=connection_overrides,
         )
 
+    def plan(
+        self,
+        profile: str | Any = "smoke_v1",
+        frames: int | None = None,
+        guard_frames: int | None = None,
+    ) -> "CapturePlan":
+        """Compile a typed :class:`~awr2944_dca.api._capture_plan.CapturePlan` without touching hardware.
+
+        All values are snapshotted at call time; subsequent mutations to
+        ``p.config`` have no effect on the returned plan.
+
+        Example::
+
+            plan = p.capture.plan("smoke_v1", frames=8, guard_frames=1)
+            plan.cube_shape      # (8, 128, 4, 256)
+            plan.awr_commands    # tuple of SDK CLI strings
+            plan.to_dict()       # legacy-compatible dict == p.capture.dry_run(...)
+        """
+        from awr2944_dca.api._config_resolver import resolve_capture_config
+        from awr2944_dca.api._capture_plan import CapturePlan
+
+        resolved = resolve_capture_config(
+            project=self._project,
+            profile=profile,
+            frames=frames,
+            guard_frames=guard_frames,
+        )
+        return CapturePlan._from_resolved(resolved, self._project, profile)
+
     def dry_run(
         self,
         profile: str | Any = "smoke_v1",
@@ -167,9 +196,17 @@ class FacadeCaptureApi:
         guard_frames: int | None = None,
         **kwargs,  # Accept com_port, host_ip, dca_ip for backward compat
     ) -> dict:
-        """Calculate and report capture plan without touching hardware."""
+        """Calculate and report capture plan without touching hardware.
+
+        Returns the same keys as before Task 3.  Internally delegates to the
+        single canonical serialiser :func:`~awr2944_dca.api._capture_plan._make_dry_run_dict`.
+        """
         from awr2944_dca.api._config_resolver import resolve_capture_config
-        import dataclasses
+        from awr2944_dca.api._capture_plan import (
+            _resolve_dca_info,
+            _make_dry_run_dict,
+            _legacy_profile_display,
+        )
 
         resolved_config = resolve_capture_config(
             project=self._project,
@@ -177,55 +214,9 @@ class FacadeCaptureApi:
             frames=frames,
             guard_frames=guard_frames,
         )
-
-        plan = dataclasses.asdict(resolved_config.byte_plan)
-
-        result = {
-            "profile_name": resolved_config.source_path.name if resolved_config.source_path else ("smoke_v1" if isinstance(profile, str) else "programmatic"),
-            "effective_frames": resolved_config.byte_plan.total_frames,
-            "guard_frames": resolved_config.byte_plan.guard_frames,
-            "sdk_cli_command_count": len(resolved_config.cli_commands),
-            **plan,
-            "hardware_touched": False,
-            # Legacy-compatible keys
-            "total_frames": resolved_config.byte_plan.total_frames,
-            "canonical_frames": resolved_config.byte_plan.canonical_frames,
-            "expected_native_dca_bytes": resolved_config.byte_plan.native_dca_bytes,
-            "expected_canonical_dca_bytes": resolved_config.byte_plan.canonical_dca_bytes,
-            "logical_depacked_bytes": resolved_config.byte_plan.native_active_payload_bytes,
-            "canonical_logical_bytes": resolved_config.byte_plan.canonical_active_payload_bytes,
-            "canonical_cube": [
-                resolved_config.byte_plan.canonical_frames,
-                resolved_config.byte_plan.chirps_per_frame,
-                resolved_config.byte_plan.rx_channels,
-                resolved_config.byte_plan.samples_per_chirp,
-            ],
-            "dca_storage_expansion_factor": resolved_config.byte_plan.dca_expansion_factor,
-        }
-        # Add toolchain DCA paths if available
-        try:
-            from awr2944_dca.lab import CaptureApi
-            legacy_api = CaptureApi(self._project)
-            toolchain = legacy_api._load_toolchain()
-            dca_control_exe = "NOT_CONFIGURED"
-            dca_config_source = "NOT_CONFIGURED"
-            dca_config_runtime_path = "NOT_CONFIGURED"
-            if toolchain:
-                from pathlib import Path as _P
-                dca_control_exe = toolchain.get("dca_cli_control_exe", "NOT_CONFIGURED")
-                dca_config_source = toolchain.get("dca_cli_cf_json", "NOT_CONFIGURED")
-                cf_json_path = _P(toolchain.get("dca_cli_cf_json", ""))
-                if not cf_json_path.exists():
-                    cf_json_path = self._project.root / "tools" / "dca1000" / "cf.json"
-                if not cf_json_path.exists():
-                    cf_json_path = _P("C:\\ti\\cf.json")
-                dca_config_runtime_path = str(cf_json_path)
-            result["dca_control_executable"] = dca_control_exe
-            result["dca_config_source"] = dca_config_source
-            result["dca_config_runtime_path"] = dca_config_runtime_path
-        except Exception:
-            pass
-        return result
+        dca_info       = _resolve_dca_info(self._project)
+        legacy_display = _legacy_profile_display(resolved_config, profile)
+        return _make_dry_run_dict(resolved_config, dca_info, legacy_display)
 
     def run_smoke(self, name: str = "dca_capture", **kwargs) -> CaptureRunResult:
         """Convenience wrapper for the smoke_v1 profile."""

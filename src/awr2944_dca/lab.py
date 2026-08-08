@@ -158,6 +158,25 @@ class RadarProject:
             self._hardware = HardwareManager(self)
         return self._hardware
 
+    @property
+    def dca(self) -> 'DcaFacade':
+        """DCA1000 status, configuration, and aliveness check facade.
+
+        Reads exclusively from ``ProjectConfig`` (modern TOML-based
+        configuration).  Works on a fresh unconfigured project.
+
+        Quick reference::
+
+            p.dca.status()       # read-only readiness check (no subprocess)
+            p.dca.config()       # ProjectConfig vs cf.json comparison
+            p.dca.verify()       # live aliveness via DcaCli.query_sys_status()
+            p.dca.fpga_version() # live FPGA version via DcaCli.fpga_version()
+        """
+        if not hasattr(self, '_dca_facade'):
+            from awr2944_dca.api._dca_facade import DcaFacade
+            self._dca_facade = DcaFacade(self)
+        return self._dca_facade
+
     def doctor(self, include_hardware: bool = True) -> 'HardwareReport':
         """Run project health and hardware diagnostics."""
         return self.hardware.verify(include_hardware=include_hardware)
