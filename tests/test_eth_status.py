@@ -945,3 +945,225 @@ class TestReadOnlyCallGraph:
         with patch("awr2944_dca.dca.preflight._run_ps_json") as mock_ps:
             p.eth.status(_snapshot_fn=lambda: rows)
             mock_ps.assert_not_called()
+
+
+# ===========================================================================
+# Item 1: Link state is part of clean readiness
+# ===========================================================================
+
+class TestLinkStateReadiness:
+    """Verify that link-down adapters never produce ready=True."""
+
+    def test_ETH15A_link_down_host_ip_not_ready(self):
+        """192.168.33.30/24, link=Down, no gateway -> ready=False, link-down warning."""
+        cfg = _make_config(host_ip="192.168.33.30")
+        rows = [_row(alias="Ethernet 2", ip="192.168.33.30", prefix=24,
+                     has_gateway=False, status="Disconnected")]
+        st = build_eth_status(cfg, rows)
+        assert st.host_ip_present is True, "IP must be detected even when link is down"
+        assert st.ready is False, "Link-down adapter must not be ready"
+        link_warnings = [w for w in st.warnings
+                         if "link" in w.lower() or "cable" in w.lower()
+                         or "disconnected" in w.lower() or "up" in w.lower()]
+        assert len(link_warnings) >= 1, (
+            f"Expected a link-down warning, got: {st.warnings}"
+        )
+
+    def test_ETH15B_link_up_host_ip_is_ready(self):
+        """192.168.33.30/24, link=Up, no gateway -> ready=True."""
+        cfg = _make_config(host_ip="192.168.33.30")
+        rows = [_row(alias="Ethernet 2", ip="192.168.33.30", prefix=24,
+                     has_gateway=False, status="Up")]
+        st = build_eth_status(cfg, rows)
+        assert st.host_ip_present is True
+        assert st.ready is True
+
+    def test_ETH15C_link_state_case_insensitive(self):
+        """link_state='up' (lowercase) is also treated as Up."""
+        cfg = _make_config(host_ip="192.168.33.30")
+        rows = [_row(alias="Ethernet 2", ip="192.168.33.30", prefix=24,
+                     has_gateway=False, status="up")]
+        st = build_eth_status(cfg, rows)
+        assert st.ready is True
+
+    def test_ETH15D_non_up_link_states_not_ready(self):
+        """Various non-Up link states must all produce ready=False."""
+        cfg = _make_config(host_ip="192.168.33.30")
+        for bad_state in ("Disconnected", "Disabled", "Not Present", "Unknown"):
+            rows = [_row(alias="Ethernet 2", ip="192.168.33.30", prefix=24,
+                         has_gateway=False, status=bad_state)]
+            st = build_eth_status(cfg, rows)
+            assert st.ready is False, (
+                f"link_state={bad_state!r} should produce ready=False"
+            )
+
+
+# ===========================================================================
+# Item 2: Duplicate host-IP ownership must not be ready
+# ===========================================================================
+
+class TestDuplicateIPOwnership:
+    """Two adapters with the same host IP -> ready=False + misconfiguration warning."""
+
+    def test_ETH16_duplicate_ip_is_not_ready(self):
+        """Ethernet 2 and Ethernet 3 both have 192.168.33.30/24 -> ready=False."""
+        cfg = _make_config(host_ip="192.168.33.30")
+        rows = [
+            _row(alias="Ethernet 2", ip="192.168.33.30", prefix=24,
+                 has_gateway=False, status="Up"),
+            _row(alias="Ethernet 3", ip="192.168.33.30", prefix=24,
+                 has_gateway=False, status="Up"),
+        ]
+        st = build_eth_status(cfg, rows)
+        assert st.host_ip_present is True, "IP presence must still be detected"
+        assert st.ready is False, "Duplicate IP must block ready"
+        dup_warnings = [w for w in st.warnings
+                        if "multiple" in w.lower() or "duplicate" in w.lower()
+                        or "misconfiguration" in w.lower()]
+        assert len(dup_warnings) >= 1, (
+            f"Expected a misconfiguration warning for duplicate IP, got: {st.warnings}"
+        )
+
+    def test_ETH16_duplicate_ip_warning_names_both_adapters(self):
+        """Duplicate-IP warning must name the offending adapters."""
+        cfg = _make_config(host_ip="192.168.33.30")
+        rows = [
+            _row(alias="Alpha", ip="192.168.33.30", prefix=24,
+                 has_gateway=False, status="Up"),
+            _row(alias="Beta",  ip="192.168.33.30", prefix=24,
+                 has_gateway=False, status="Up"),
+        ]
+        st = build_eth_status(cfg, rows)
+        assert st.ready is False
+        # At least one warning must name both adapters
+        combined = " ".join(st.warnings)
+        assert "Alpha" in combined and "Beta" in combined, (
+            f"Warnings should name both adapters. Got: {st.warnings}"
+        )
+
+    def test_ETH16_single_owner_still_ready(self):
+        """Single adapter with host IP + /24 + Up + no gateway -> ready=True."""
+        cfg = _make_config(host_ip="192.168.33.30")
+        rows = [
+            _row(alias="Ethernet 2", ip="192.168.33.30", prefix=24,
+                 has_gateway=False, status="Up"),
+        ]
+        st = build_eth_status(cfg, rows)
+        assert st.ready is True
+
+
+# ===========================================================================
+# Item 3: Configured DCA IP must be in the host /24 subnet
+# ===========================================================================
+
+class TestDCASubnetCheck:
+    """DCA IP must be reachable from the host's /24 subnet for ready=True."""
+
+    def test_ETH17_dca_in_same_subnet_is_ready(self):
+        """host=192.168.33.30/24, dca=192.168.33.180 -> same /24, ready=True."""
+        cfg = _make_config(host_ip="192.168.33.30", dca_ip="192.168.33.180")
+        rows = [_row(alias="Ethernet 2", ip="192.168.33.30", prefix=24,
+                     has_gateway=False, status="Up")]
+        st = build_eth_status(cfg, rows)
+        assert st.ready is True
+        dca_warnings = [w for w in st.warnings if "outside" in w.lower() or "subnet" in w.lower()]
+        assert len(dca_warnings) == 0
+
+    def test_ETH17_dca_outside_subnet_not_ready(self):
+        """host=192.168.33.30/24, dca=10.0.0.180 -> different subnet, ready=False."""
+        cfg = _make_config(host_ip="192.168.33.30", dca_ip="10.0.0.180")
+        rows = [_row(alias="Ethernet 2", ip="192.168.33.30", prefix=24,
+                     has_gateway=False, status="Up")]
+        st = build_eth_status(cfg, rows)
+        assert st.ready is False
+        dca_warnings = [w for w in st.warnings
+                        if "outside" in w.lower() or "subnet" in w.lower()
+                        or "10.0.0.180" in w]
+        assert len(dca_warnings) >= 1, (
+            f"Expected DCA subnet warning, got: {st.warnings}"
+        )
+
+    def test_ETH17_dca_warning_mentions_both_ips(self):
+        """DCA subnet mismatch warning must name both host and DCA IPs."""
+        cfg = _make_config(host_ip="192.168.33.30", dca_ip="10.0.0.180")
+        rows = [_row(alias="Ethernet 2", ip="192.168.33.30", prefix=24,
+                     has_gateway=False, status="Up")]
+        st = build_eth_status(cfg, rows)
+        combined = " ".join(st.warnings)
+        assert "10.0.0.180" in combined, "Warning must name the bad DCA IP"
+
+    def test_ETH17_no_host_ip_skips_subnet_check(self):
+        """If host_ip is not configured, subnet check is skipped (no false alarm)."""
+        cfg = _make_config(host_ip="")
+        rows = []
+        st = build_eth_status(cfg, rows)
+        # Only warning should be about missing host_ip, not subnet mismatch
+        subnet_warnings = [w for w in st.warnings if "outside" in w.lower() or "subnet" in w.lower()]
+        assert len(subnet_warnings) == 0
+
+    def test_ETH17_no_host_ip_adapter_skips_subnet_check(self):
+        """If host IP is not on any adapter, subnet check is skipped."""
+        cfg = _make_config(host_ip="192.168.33.30", dca_ip="10.0.0.180")
+        rows = [_row(alias="Ethernet 2", ip="169.254.77.130", prefix=16,
+                     has_gateway=False, status="Up")]
+        st = build_eth_status(cfg, rows)
+        # No host IP present -> no ip_adapter -> no subnet check
+        assert not st.host_ip_present
+        subnet_warnings = [w for w in st.warnings if "outside" in w.lower() and "10.0.0.180" in w]
+        assert len(subnet_warnings) == 0, (
+            "Subnet check must not fire when host IP is not on any adapter"
+        )
+
+
+# ===========================================================================
+# Item 4: Readiness label precision
+# ===========================================================================
+
+class TestReadinessLabelPrecision:
+    """Verify user-visible 'ready' label refers to NIC config, not full capture stack."""
+
+    def _ready_status(self):
+        cfg = _make_config(host_ip="192.168.33.30", dca_ip="192.168.33.180")
+        rows = [_row(alias="Ethernet 2", ip="192.168.33.30", prefix=24,
+                     has_gateway=False, status="Up")]
+        return build_eth_status(cfg, rows)
+
+    def _not_ready_status(self):
+        cfg = _make_config(host_ip="192.168.33.30", dca_ip="192.168.33.180")
+        rows = [_row(alias="Ethernet 2", ip="169.254.77.130", prefix=16,
+                     has_gateway=False, status="Up")]
+        return build_eth_status(cfg, rows)
+
+    def test_ETH18_print_uses_nic_configuration_label(self, capsys):
+        """print() must say 'DCA NIC configuration ready', not 'Ready for capture'."""
+        st = self._ready_status()
+        st.print()
+        out = capsys.readouterr().out
+        assert "DCA NIC configuration ready" in out, (
+            f"Expected 'DCA NIC configuration ready' in output, got:\n{out}"
+        )
+        assert "Ready for capture" not in out
+        # Not-ready path
+        st2 = self._not_ready_status()
+        st2.print()
+        out2 = capsys.readouterr().out
+        assert "DCA NIC configuration ready: NO" in out2
+
+    def test_ETH18_repr_uses_nic_label(self):
+        """repr() must say 'DCA NIC ready' or 'DCA NIC NOT ready'."""
+        r_ready = repr(self._ready_status())
+        r_not   = repr(self._not_ready_status())
+        assert "DCA NIC" in r_ready, f"repr missing 'DCA NIC': {r_ready}"
+        assert "DCA NIC" in r_not,   f"repr missing 'DCA NIC': {r_not}"
+        assert "ready" in r_ready.lower()
+        assert "not ready" in r_not.lower() or "NOT ready" in r_not
+
+    def test_ETH18_html_uses_nic_label(self):
+        """_repr_html_() must say 'DCA NIC configuration' and not 'Ready for capture'."""
+        html_ready = self._ready_status()._repr_html_()
+        html_not   = self._not_ready_status()._repr_html_()
+        assert "DCA NIC" in html_ready, f"HTML missing 'DCA NIC': {html_ready[:300]}"
+        assert "DCA NIC" in html_not,   f"HTML missing 'DCA NIC': {html_not[:300]}"
+        assert "Ready for capture" not in html_ready
+        assert "Ready for capture" not in html_not
+        assert "not ready" in html_not.lower()

@@ -98,7 +98,7 @@ class EthernetStatusResult:
     # ------------------------------------------------------------------
 
     def __repr__(self) -> str:
-        r = "ready" if self.ready else "NOT ready"
+        r = "DCA NIC ready" if self.ready else "DCA NIC NOT ready"
         rec = self.recommended.alias if self.recommended else ("ambiguous" if self.ambiguous else "none")
         return (
             f"EthernetStatusResult({r}, "
@@ -137,7 +137,7 @@ class EthernetStatusResult:
         print("\nOverall")
         if self.host_ip_present:
             print(f"  Host IP {self.host_ip_expected} present on {self.host_ip_adapter}: YES")
-            print("  Ready for DCA verification: YES")
+            print(f"  DCA NIC configuration ready: {'YES' if self.ready else 'NO'}")
         else:
             print(f"  Host IP {self.host_ip_expected or '(not configured)'} present: NO")
             if self.recommended:
@@ -146,7 +146,7 @@ class EthernetStatusResult:
                 print("  Adapter selection: AMBIGUOUS (multiple plausible adapters)")
             else:
                 print("  Likely DCA adapter: NONE FOUND")
-            print("  Ready: NO")
+            print("  DCA NIC configuration ready: NO")
 
         for w in self.warnings:
             print(f"\n  ⚠ {w}")
@@ -155,7 +155,7 @@ class EthernetStatusResult:
     def _repr_html_(self) -> str:
         """Jupyter HTML representation."""
         ready_color = "#7fdbca" if self.ready else "#ff6b6b"
-        ready_text  = "✅ Ready" if self.ready else "❌ Not Ready"
+        ready_text  = "✅ DCA NIC configuration ready" if self.ready else "❌ DCA NIC configuration not ready"
 
         rows = ""
         for c in self.candidates:
@@ -526,37 +526,85 @@ def build_eth_status(cfg: "ProjectConfig", raw_adapters: list[dict]) -> Ethernet
     config_port = cfg.portable.config_port
     data_port   = cfg.portable.data_port
     # Expected prefix length for the configured host IP (default /24)
-    expected_prefix = getattr(cfg.portable, "host_ip_prefix", 24)
-    # ProjectConfig doesn't expose host_ip_prefix; use 24 as the canonical default
-    expected_prefix = 24
+    expected_prefix = 24  # canonical — ProjectConfig doesn't expose host_ip_prefix
 
     candidates = rank_adapter_candidates(raw_adapters, host_ip)
     recommended, ambiguous = pick_recommended(candidates)
 
-    # --- ready logic: IP present + correct prefix + no gateway on that adapter ---
-    ip_adapter    = next((c for c in candidates if c.owns_host_ip), None)
-    host_ip_present = ip_adapter is not None
-    host_ip_adapter = ip_adapter.alias if ip_adapter else ""
+    # --- Collect ALL adapters that claim to own the host IP ---
+    ip_owners = [c for c in candidates if c.owns_host_ip]
+    host_ip_present = len(ip_owners) > 0
+    host_ip_adapter = ip_owners[0].alias if len(ip_owners) == 1 else (
+        ", ".join(c.alias for c in ip_owners) if ip_owners else ""
+    )
+
+    # Duplicate ownership: two adapters with the same IP — not clean-ready
+    duplicate_ip = len(ip_owners) > 1
+
+    # For readiness checks, use the single owner (or None if zero or duplicate)
+    ip_adapter = ip_owners[0] if len(ip_owners) == 1 else None
 
     prefix_correct = (
         ip_adapter is not None
         and ip_adapter.host_ip_prefix == expected_prefix
     )
+    # Link must be Up on the IP-owning adapter
+    link_up = (
+        ip_adapter is not None
+        and ip_adapter.link_state.lower() == "up"
+    )
     # An adapter with the correct IP but a default gateway is still unsafe
     gateway_on_ip_adapter = ip_adapter is not None and ip_adapter.has_gateway
 
-    # True only when all three conditions hold
-    ready = host_ip_present and prefix_correct and not gateway_on_ip_adapter
+    # DCA IP must fall within the host /24 subnet
+    dca_in_subnet = False
+    if host_ip and dca_ip and ip_adapter is not None:
+        try:
+            import ipaddress
+            host_net = ipaddress.IPv4Network(
+                f"{host_ip}/{expected_prefix}", strict=False
+            )
+            dca_in_subnet = ipaddress.IPv4Address(dca_ip) in host_net
+        except (ValueError, TypeError):
+            dca_in_subnet = False
+    elif not host_ip or not dca_ip:
+        # Can't validate without both addresses; don't block ready on missing config
+        dca_in_subnet = True
+
+    # True only when ALL five conditions hold
+    ready = (
+        host_ip_present
+        and not duplicate_ip
+        and prefix_correct
+        and link_up
+        and not gateway_on_ip_adapter
+        and dca_in_subnet
+    )
 
     warnings: list[str] = []
     if not host_ip:
-        warnings.append("host_ip is not configured in local.toml — run p.hardware.autodetect_serial(save=True) or edit .awr2944/local.toml")
-    if host_ip_present and not prefix_correct and ip_adapter:
+        warnings.append(
+            "host_ip is not configured in local.toml "
+            "— run p.hardware.autodetect_serial(save=True) or edit .awr2944/local.toml"
+        )
+    if duplicate_ip:
+        aliases = ", ".join(c.alias for c in ip_owners)
+        warnings.append(
+            f"Host IP {host_ip} found on multiple adapters ({aliases}) "
+            "— misconfiguration; remove from all but one dedicated DCA adapter"
+        )
+    if host_ip_present and not duplicate_ip and not prefix_correct and ip_adapter:
         actual = ip_adapter.host_ip_prefix
         warnings.append(
             f"Adapter '{ip_adapter.alias}' has host IP {host_ip} "
-            f"but prefix /{actual} does not match expected /{expected_prefix} — "
-            f"reconfigure to /{expected_prefix}"
+            f"but prefix /{actual} does not match expected /{expected_prefix} "
+            f"— reconfigure to /{expected_prefix}"
+        )
+    if host_ip_present and not duplicate_ip and not link_up and ip_adapter:
+        warnings.append(
+            f"Adapter '{ip_adapter.alias}' has host IP {host_ip} "
+            "but link state is not Up "
+            "— check cable/USB-Ethernet adapter connection"
         )
     if gateway_on_ip_adapter and ip_adapter:
         warnings.append(
@@ -564,11 +612,20 @@ def build_eth_status(cfg: "ProjectConfig", raw_adapters: list[dict]) -> Ethernet
             "but also has a default gateway — this is a normal network NIC, "
             "DO NOT use for DCA1000; assign the IP to a dedicated adapter"
         )
-    unsafe_candidates = [c for c in candidates if c.confidence == CONF_UNSAFE and c is not ip_adapter]
+    if host_ip and dca_ip and ip_adapter is not None and not dca_in_subnet:
+        warnings.append(
+            f"Configured DCA IP {dca_ip} is outside the host subnet "
+            f"{host_ip}/{expected_prefix} "
+            f"— DCA1000 will not be reachable; check project dca_ip setting"
+        )
+    unsafe_candidates = [
+        c for c in candidates
+        if c.confidence == CONF_UNSAFE and c not in ip_owners
+    ]
     for c in unsafe_candidates:
         warnings.append(
-            f"Adapter '{c.alias}' has a default gateway — "
-            "DO NOT assign the DCA host IP to this adapter"
+            f"Adapter '{c.alias}' has a default gateway "
+            "— DO NOT assign the DCA host IP to this adapter"
         )
 
     return EthernetStatusResult(
