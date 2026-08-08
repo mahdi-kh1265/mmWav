@@ -3,9 +3,16 @@ from pathlib import Path
 from awr2944_dca.lab import RadarProject
 from awr2944_dca.viewer_ctrl import ViewerExportUnsupportedError
 
+_LIVE_PROJECT_ROOT = Path(r"C:\Users\khams008\Documents\awr2944-live-project")
+
 @pytest.mark.matlab_live
+@pytest.mark.skipif(
+    not _LIVE_PROJECT_ROOT.exists(),
+    reason="Live project root not present on this machine (C:\\Users\\khams008\\...)",
+)
 def test_export_plot_live():
-    PROJECT_ROOT = Path(r"C:\Users\khams008\Documents\awr2944-live-project")
+    PROJECT_ROOT = _LIVE_PROJECT_ROOT
+
     # Using an arbitrary complete capture for testing
     project = RadarProject.open(PROJECT_ROOT)
     complete = [c for c in project.captures.list() if c.status().get('status') == 'complete']

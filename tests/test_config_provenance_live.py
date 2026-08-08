@@ -4,7 +4,6 @@ import hashlib
 from pathlib import Path
 from awr2944_dca.lab import RadarProject
 
-@pytest.mark.hardware_live
 def _validate_capture(capture):
     output_dir = capture.path
     
@@ -71,6 +70,10 @@ def _validate_capture(capture):
     assert capture.raw.to_cube(kind="canonical").shape == (8, 128, 4, 256)
 
 @pytest.mark.hardware_live
+@pytest.mark.skipif(
+    not Path(".").joinpath("awr2944.toml").exists(),
+    reason="Not inside a RadarProject directory (no awr2944.toml in cwd)",
+)
 def test_config_provenance_hardware_live():
     project = RadarProject(Path("."))
     result = project.capture.run("smoke_v1", frames=8, guard_frames=1)

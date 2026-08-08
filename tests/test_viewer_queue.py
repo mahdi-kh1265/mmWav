@@ -552,6 +552,10 @@ class TestLifecyclePreservation:
 # Live-MATLAB acceptance (gated: pytest -m matlab_live)
 # ===========================================================================
 @pytest.mark.matlab_live
+@pytest.mark.skipif(
+    not Path(r"C:\Users\khams008\Documents\awr2944-live-project").exists(),
+    reason="Live MATLAB project root not present on this machine (C:\\Users\\khams008\\...)",
+)
 class TestLiveMatlabViewer:
     """
     Requires real MATLAB, pywin32, and the accepted capture.
