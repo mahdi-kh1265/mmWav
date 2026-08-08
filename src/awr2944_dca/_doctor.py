@@ -141,23 +141,41 @@ class DiscoveryReport:
                 show_lines=False,
                 title_style="bold yellow",
             )
-            nt.add_column("Interface Alias", style="bold white")
-            nt.add_column("IPv4 / Address", style="cyan")
-            nt.add_column("Prefix", justify="right")
-            nt.add_column("Family", justify="center")
+            nt.add_column("Alias", style="bold white", no_wrap=True)
+            nt.add_column("Description", style="cyan")
+            nt.add_column("IPv4 Address", style="green")
+            nt.add_column("/Pfx", justify="right")
+            nt.add_column("Link", justify="center")
+            nt.add_column("GW?", justify="center")
+            nt.add_column("MAC", style="dim")
 
             for adapter in self.network_adapters:
                 family_raw = adapter.get("AddressFamily", "")
-                # AddressFamily: 2 = IPv4, 23 = IPv6, or string from PS
                 if isinstance(family_raw, int):
-                    family_str = "IPv4" if family_raw == 2 else ("IPv6" if family_raw == 23 else str(family_raw))
+                    family_str = "IPv4" if family_raw == 2 else "IPv6"
                 else:
                     family_str = str(family_raw)
+                # Only show IPv4 rows (AddressFamily == 2) in the primary display
+                if family_str == "IPv6":
+                    continue
+                link_raw = adapter.get("_Status", "")
+                if link_raw == "Up":
+                    link_str = "[green]Up[/green]"
+                elif link_raw == "Disconnected":
+                    link_str = "[red]Down[/red]"
+                elif link_raw:
+                    link_str = f"[yellow]{link_raw}[/yellow]"
+                else:
+                    link_str = ""
+                gw_str = "[bold green]YES[/bold green]" if adapter.get("_has_gateway") else ""
                 nt.add_row(
                     adapter.get("InterfaceAlias", ""),
+                    adapter.get("_Description", ""),
                     adapter.get("IPAddress", ""),
                     str(adapter.get("PrefixLength", "")),
-                    family_str,
+                    link_str,
+                    gw_str,
+                    adapter.get("_MacAddress", ""),
                 )
 
             if self.network_adapters:
@@ -210,11 +228,25 @@ class DiscoveryReport:
                 family_str = "IPv4" if family_raw == 2 else ("IPv6" if family_raw == 23 else str(family_raw))
             else:
                 family_str = str(family_raw)
+            if family_str == "IPv6":
+                continue  # suppress IPv6 rows; only IPv4 shown
+            link_raw = adapter.get("_Status", "")
+            link_html = (
+                f"<span style='color:green'>{link_raw}</span>" if link_raw == "Up"
+                else (f"<span style='color:red'>{link_raw}</span>" if link_raw == "Disconnected"
+                      else link_raw)
+            )
+            gw_html = "&#10003;" if adapter.get("_has_gateway") else ""
             rows_net += (
-                f"<tr><td><b>{adapter.get('InterfaceAlias','')}</b></td>"
+                f"<tr>"
+                f"<td><b>{adapter.get('InterfaceAlias','')}</b></td>"
+                f"<td>{adapter.get('_Description','')}</td>"
                 f"<td>{adapter.get('IPAddress','')}</td>"
                 f"<td>{adapter.get('PrefixLength','')}</td>"
-                f"<td>{family_str}</td></tr>"
+                f"<td style='text-align:center'>{link_html}</td>"
+                f"<td style='text-align:center'>{gw_html}</td>"
+                f"<td><code>{adapter.get('_MacAddress','')}</code></td>"
+                f"</tr>"
             )
         if not rows_net:
             rows_net = "<tr><td colspan='4'><i>none found</i></td></tr>"
@@ -229,10 +261,10 @@ class DiscoveryReport:
             f"<tr><th {th}>Port</th><th {th}>Friendly Name</th><th {th}>VID:PID</th>"
             f"<th {th}>XDS110</th><th {th}>Role</th><th {th}>Conf</th></tr>"
             f"{rows_com}</table>"
-            f"<h4 style='margin:8px 0 2px'>Network Adapters</h4>"
+            f"<h4 style='margin:8px 0 2px'>Network Adapters (IPv4)</h4>"
             f"<table style='{style}'>"
-            f"<tr><th {th}>Interface Alias</th><th {th}>IP Address</th>"
-            f"<th {th}>Prefix</th><th {th}>Family</th></tr>"
+            f"<tr><th {th}>Alias</th><th {th}>Description</th><th {th}>IPv4</th>"
+            f"<th {th}>Pfx</th><th {th}>Link</th><th {th}>GW?</th><th {th}>MAC</th></tr>"
             f"{rows_net}</table></details>"
         )
 
@@ -372,11 +404,49 @@ class HardwareManager:
         if f in ("", "network"):
             try:
                 from awr2944_dca.dca.preflight import _run_ps_json, _as_dicts
-                script = (
+
+                # --- IP addresses (base data) ---------------------------------
+                ip_script = (
                     "Get-NetIPAddress -ErrorAction SilentlyContinue "
                     "| Select-Object InterfaceAlias, IPAddress, PrefixLength, AddressFamily"
                 )
-                net_adapters = _as_dicts(_run_ps_json(script))
+                net_adapters = _as_dicts(_run_ps_json(ip_script))
+
+                # --- Adapter metadata (description, link state, MAC) ----------
+                # Read-only query; never configures anything.
+                adp_script = (
+                    "Get-NetAdapter -ErrorAction SilentlyContinue "
+                    "| Select-Object Name, InterfaceDescription, Status, MacAddress"
+                )
+                adp_rows = _as_dicts(_run_ps_json(adp_script))
+                # Build lookup: alias -> {description, status, mac}
+                adp_by_alias: dict = {}
+                for row in adp_rows:
+                    alias = row.get("Name", "")
+                    if alias:
+                        adp_by_alias[alias] = {
+                            "_Description": row.get("InterfaceDescription", ""),
+                            "_Status": row.get("Status", ""),
+                            "_MacAddress": row.get("MacAddress", ""),
+                        }
+
+                # --- Default-gateway flags ------------------------------------
+                # Get-NetRoute -DestinationPrefix 0.0.0.0/0 lists default routes.
+                # Read-only; no mutation.
+                gw_script = (
+                    "Get-NetRoute -DestinationPrefix '0.0.0.0/0' "
+                    "-ErrorAction SilentlyContinue "
+                    "| Select-Object InterfaceAlias"
+                )
+                gw_rows = _as_dicts(_run_ps_json(gw_script))
+                gw_aliases: set = {r.get("InterfaceAlias", "") for r in gw_rows if r.get("InterfaceAlias")}
+
+                # Merge enrichment into each ip-address row
+                for row in net_adapters:
+                    alias = row.get("InterfaceAlias", "")
+                    row.update(adp_by_alias.get(alias, {}))
+                    row["_has_gateway"] = alias in gw_aliases
+
             except Exception:
                 pass
 
