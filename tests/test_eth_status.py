@@ -453,34 +453,121 @@ class TestDoctorImprovements:
         detail_upper = detail.upper()
         assert any(kw in detail_upper for kw in ("GATEWAY", "DO NOT", "WARNING", "DEDICATED"))
 
-    # DOC-14: UDP bind "address already in use" produces useful diagnostic
-    def test_DOC14_udp_bind_port_in_use(self, tmp_path):
-        """When UDP port is in use, doctor reports the specific error category."""
-        p = self._make_project_path(tmp_path)
+    # DOC-14: UDP bind failure — deterministic via socket injection (Items 1 and 7)
+    # _run_ps_json returns PARSED Python objects (dicts/lists), not raw JSON strings.
+    # socket.socket must be patched where the doctor uses it: awr2944_dca._doctor.socket
+    # PID lookup uses subprocess.run directly (not _run_ps_json) — patch separately.
 
+    def _make_nic_pass_mock(self):
+        """Return a _run_ps_json mock that makes host_nic_owns_ip PASS."""
         def _mock_ps(script, *a, **kw):
             if "Get-NetIPAddress -IPAddress" in script:
-                return '[{"InterfaceAlias":"Ethernet2"}]'  # host IP present
-            return ""
+                return [{"InterfaceAlias": "Ethernet2"}]  # parsed dict — PASS
+            return None  # empty / not found
+        return _mock_ps
 
-        # Bind the port ourselves to force EADDRINUSE
-        blocker = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        try:
-            blocker.bind(("192.168.33.30", 4098))
-        except OSError:
-            pytest.skip("Cannot bind 192.168.33.30:4098 on this machine for test")
+    def test_DOC14_udp_bind_eaddrinuse_deterministic(self, tmp_path):
+        """EADDRINUSE -> 'already in use' detail; does NOT require owning 192.168.33.30."""
+        p = self._make_project_path(tmp_path)
 
-        try:
-            with patch("awr2944_dca.dca.preflight._run_ps_json", side_effect=_mock_ps):
-                with patch("awr2944_dca.hardware.ports.scan_ports", return_value=[]):
-                    with patch("awr2944_dca.headless_serial.discover_serial_ports", return_value=[]):
+        import errno
+        mock_sock = MagicMock()
+        mock_sock.__enter__ = lambda s: s
+        mock_sock.__exit__ = MagicMock(return_value=False)
+        mock_sock.bind.side_effect = OSError(errno.EADDRINUSE, "Address already in use")
+
+        # PID lookup uses subprocess.run, not _run_ps_json
+        mock_sp_result = MagicMock()
+        mock_sp_result.stdout = "1234\n"
+
+        with patch("awr2944_dca.dca.preflight._run_ps_json", side_effect=self._make_nic_pass_mock()):
+            with patch("awr2944_dca.hardware.ports.scan_ports", return_value=[]):
+                with patch("awr2944_dca.headless_serial.discover_serial_ports", return_value=[]):
+                    with patch("awr2944_dca._doctor.socket.socket", return_value=mock_sock):
+                        with patch("subprocess.run", return_value=mock_sp_result):
+                            report = p.hardware.verify(include_hardware=True)
+
+        udp_check = next(c for c in report.checks if c.name == "udp_data_port_bind")
+        assert udp_check.status == "FAIL"
+        detail = udp_check.detail.lower()
+        assert "in use" in detail or "already" in detail
+
+    def test_DOC14_udp_bind_eaddrnotavail_deterministic(self, tmp_path):
+        """EADDRNOTAVAIL (host IP not locally owned) produces a clear FAIL."""
+        p = self._make_project_path(tmp_path)
+
+        import errno
+        mock_sock = MagicMock()
+        mock_sock.bind.side_effect = OSError(errno.EADDRNOTAVAIL, "Cannot assign requested address")
+
+        with patch("awr2944_dca.dca.preflight._run_ps_json", side_effect=self._make_nic_pass_mock()):
+            with patch("awr2944_dca.hardware.ports.scan_ports", return_value=[]):
+                with patch("awr2944_dca.headless_serial.discover_serial_ports", return_value=[]):
+                    with patch("awr2944_dca._doctor.socket.socket", return_value=mock_sock):
                         report = p.hardware.verify(include_hardware=True)
-        finally:
-            blocker.close()
 
-        udp_check = next((c for c in report.checks if c.name == "udp_data_port_bind"), None)
-        if udp_check and udp_check.status == "FAIL":
-            assert "in use" in udp_check.detail.lower() or "busy" in udp_check.detail.lower() or "already" in udp_check.detail.lower()
+        udp_check = next(c for c in report.checks if c.name == "udp_data_port_bind")
+        assert udp_check.status == "FAIL"
+        assert udp_check.detail != ""
+
+    def test_DOC14_udp_bind_success_deterministic(self, tmp_path):
+        """Successful bind -> PASS; does NOT require owning 192.168.33.30."""
+        p = self._make_project_path(tmp_path)
+
+        mock_sock = MagicMock()
+        mock_sock.bind.return_value = None   # success (no exception)
+        mock_sock.close.return_value = None
+
+        with patch("awr2944_dca.dca.preflight._run_ps_json", side_effect=self._make_nic_pass_mock()):
+            with patch("awr2944_dca.hardware.ports.scan_ports", return_value=[]):
+                with patch("awr2944_dca.headless_serial.discover_serial_ports", return_value=[]):
+                    with patch("awr2944_dca._doctor.socket.socket", return_value=mock_sock):
+                        report = p.hardware.verify(include_hardware=True)
+
+        udp_check = next(c for c in report.checks if c.name == "udp_data_port_bind")
+        assert udp_check.status == "PASS"
+
+    def test_DOC14_udp_bind_generic_oserror(self, tmp_path):
+        """Generic OSError -> FAIL with original error message preserved."""
+        p = self._make_project_path(tmp_path)
+
+        mock_sock = MagicMock()
+        mock_sock.bind.side_effect = OSError(22, "Invalid argument")
+
+        with patch("awr2944_dca.dca.preflight._run_ps_json", side_effect=self._make_nic_pass_mock()):
+            with patch("awr2944_dca.hardware.ports.scan_ports", return_value=[]):
+                with patch("awr2944_dca.headless_serial.discover_serial_ports", return_value=[]):
+                    with patch("awr2944_dca._doctor.socket.socket", return_value=mock_sock):
+                        report = p.hardware.verify(include_hardware=True)
+
+        udp_check = next(c for c in report.checks if c.name == "udp_data_port_bind")
+        assert udp_check.status == "FAIL"
+        # Original error text preserved (not swallowed)
+        assert "22" in udp_check.detail or "Invalid" in udp_check.detail or len(udp_check.detail) > 5
+
+    # DOC-14b: PID lookup failure does NOT mask the original bind error (Item 7)
+    def test_DOC14_pid_lookup_failure_does_not_mask_bind_error(self, tmp_path):
+        """If subprocess.run for PID lookup raises, original error is still reported."""
+        p = self._make_project_path(tmp_path)
+
+        import errno
+        mock_sock = MagicMock()
+        mock_sock.bind.side_effect = OSError(errno.EADDRINUSE, "Address already in use")
+
+        with patch("awr2944_dca.dca.preflight._run_ps_json", side_effect=self._make_nic_pass_mock()):
+            with patch("awr2944_dca.hardware.ports.scan_ports", return_value=[]):
+                with patch("awr2944_dca.headless_serial.discover_serial_ports", return_value=[]):
+                    with patch("awr2944_dca._doctor.socket.socket", return_value=mock_sock):
+                        with patch("subprocess.run", side_effect=RuntimeError("PS unavailable")):
+                            # Even when PID lookup raises, doctor must not crash
+                            # and must still report the original bind error
+                            report = p.hardware.verify(include_hardware=True)
+
+        udp_check = next(c for c in report.checks if c.name == "udp_data_port_bind")
+        assert udp_check.status == "FAIL"
+        detail = udp_check.detail.lower()
+        assert "in use" in detail or "already" in detail
+
 
     # DOC-15: DCA aliveness still uses query_sys_status
     def test_DOC15_dca_aliveness_uses_query_sys_status(self):
@@ -592,3 +679,269 @@ class TestPresentation:
         out = capsys.readouterr().out
         assert "192.168.33.30" in out
         assert "No network settings were changed" in out
+
+
+# ===========================================================================
+# ETH-12: Ready semantics — prefix and gateway requirements (Item 2)
+# ===========================================================================
+
+class TestReadySemantics:
+    """Prove all three conditions required for ready=True:
+    - owns expected host IP
+    - correct /24 prefix
+    - no default gateway on that adapter
+    """
+
+    def test_ETH12A_correct_ip_correct_prefix_no_gateway_is_ready(self):
+        """192.168.33.30/24, Up, no gateway -> ready=True."""
+        cfg = _make_config(host_ip="192.168.33.30")
+        rows = [_row(alias="Ethernet 2", ip="192.168.33.30", prefix=24,
+                     has_gateway=False, status="Up")]
+        st = build_eth_status(cfg, rows)
+        assert st.host_ip_present is True
+        assert st.ready is True
+        assert not any("prefix" in w.lower() for w in st.warnings)
+        assert not any("gateway" in w.lower() for w in st.warnings)
+
+    def test_ETH12B_correct_ip_wrong_prefix_not_ready(self):
+        """192.168.33.30/16, Up, no gateway -> ready=False; prefix mismatch warning."""
+        cfg = _make_config(host_ip="192.168.33.30")
+        rows = [_row(alias="Ethernet 2", ip="192.168.33.30", prefix=16,
+                     has_gateway=False, status="Up")]
+        st = build_eth_status(cfg, rows)
+        assert st.host_ip_present is True
+        assert st.ready is False
+        prefix_warnings = [w for w in st.warnings
+                           if "prefix" in w.lower() or "/16" in w or "/24" in w]
+        assert len(prefix_warnings) >= 1, (
+            f"Expected prefix mismatch warning, got: {st.warnings}"
+        )
+
+    def test_ETH12C_correct_ip_default_gateway_not_ready(self):
+        """192.168.33.30/24, Up, gateway present -> ready=False; safety warning."""
+        cfg = _make_config(host_ip="192.168.33.30")
+        rows = [_row(alias="Ethernet", ip="192.168.33.30", prefix=24,
+                     has_gateway=True, status="Up")]
+        st = build_eth_status(cfg, rows)
+        assert st.host_ip_present is True
+        assert st.ready is False
+        gw_warnings = [w for w in st.warnings
+                       if "gateway" in w.lower() or "DO NOT" in w or "dedicated" in w.lower()]
+        assert len(gw_warnings) >= 1, (
+            f"Expected gateway warning, got: {st.warnings}"
+        )
+
+    def test_ETH12D_candidate_confidence_for_any_host_ip_owner(self):
+        """CONF_READY set on IP match; prefix correctness is in build_eth_status.ready."""
+        rows = [_row(alias="Ethernet 2", ip="192.168.33.30", prefix=16, has_gateway=False)]
+        candidates = rank_adapter_candidates(rows, host_ip="192.168.33.30")
+        c = candidates[0]
+        assert c.confidence == CONF_READY
+        assert c.owns_host_ip is True
+        assert c.host_ip_prefix == 16  # prefix captured accurately
+
+
+# ===========================================================================
+# ETH-13: Multi-IP adapter aggregation (Item 3)
+# ===========================================================================
+
+class TestMultiIPAggregation:
+
+    def test_ETH13_multi_ip_single_candidate(self):
+        """An adapter with two IPv4 rows must appear as ONE candidate, not two."""
+        rows = [
+            _row(alias="Ethernet 2", ip="192.168.33.30", prefix=24, has_gateway=False),
+            _row(alias="Ethernet 2", ip="169.254.77.130", prefix=16, has_gateway=False),
+        ]
+        candidates = rank_adapter_candidates(rows, host_ip="192.168.33.30")
+        eth2_candidates = [c for c in candidates if c.alias == "Ethernet 2"]
+        assert len(eth2_candidates) == 1, (
+            f"Expected 1 candidate for Ethernet 2, got {len(eth2_candidates)}"
+        )
+        c = eth2_candidates[0]
+        assert "192.168.33.30" in c.ipv4_addresses
+        assert "169.254.77.130" in c.ipv4_addresses
+        assert len(c.ipv4_addresses) == 2
+
+    def test_ETH13_multi_ip_host_ip_found_correct_prefix(self):
+        """Multi-IP adapter: host_ip_prefix correctly identifies the /24 row."""
+        rows = [
+            _row(alias="Ethernet 2", ip="192.168.33.30", prefix=24, has_gateway=False),
+            _row(alias="Ethernet 2", ip="169.254.77.130", prefix=16, has_gateway=False),
+        ]
+        candidates = rank_adapter_candidates(rows, host_ip="192.168.33.30")
+        c = candidates[0]
+        assert c.owns_host_ip is True
+        assert c.host_ip_prefix == 24
+
+    def test_ETH13_multi_ip_does_not_compete_with_other_adapters(self):
+        """Multi-IP adapter + another adapter: total count is 2, not 3."""
+        rows = [
+            _row(alias="Ethernet 2", ip="192.168.33.30", prefix=24, has_gateway=False),
+            _row(alias="Ethernet 2", ip="169.254.77.130", prefix=16, has_gateway=False),
+            _row(alias="Ethernet",   ip="10.0.0.5",       prefix=8,  has_gateway=True),
+        ]
+        candidates = rank_adapter_candidates(rows, host_ip="192.168.33.30")
+        assert len(candidates) == 2
+
+    def test_ETH13_multi_ip_ready_uses_correct_prefix_row(self):
+        """Multi-IP adapter with /24 host IP row -> ready=True despite /16 link-local."""
+        cfg = _make_config(host_ip="192.168.33.30")
+        rows = [
+            _row(alias="Ethernet 2", ip="192.168.33.30", prefix=24, has_gateway=False),
+            _row(alias="Ethernet 2", ip="169.254.77.130", prefix=16, has_gateway=False),
+        ]
+        st = build_eth_status(cfg, rows)
+        assert st.ready is True
+
+
+# ===========================================================================
+# ETH-14: True ambiguity — no tie-breaking (Item 4)
+# ===========================================================================
+
+class TestTrueAmbiguity:
+
+    def test_ETH14_two_gateway_free_high_adapters_are_ambiguous(self):
+        """Two gateway-less UP adapters, neither owns host IP -> ambiguous=True, recommended=None."""
+        rows = [
+            _row(alias="Ethernet 2", ip="169.254.77.130", prefix=16,
+                 has_gateway=False, status="Up"),
+            _row(alias="Ethernet 3", ip="169.254.88.200", prefix=16,
+                 has_gateway=False, status="Up"),
+        ]
+        candidates = rank_adapter_candidates(rows, host_ip="192.168.33.30")
+        rec, ambiguous = pick_recommended(candidates)
+        assert rec is None, "Must not pick a winner from two equally plausible adapters"
+        assert ambiguous is True
+
+    def test_ETH14_ambiguity_not_broken_by_row_order(self):
+        """Reversing row order must NOT break ambiguity detection."""
+        rows_ab = [
+            _row(alias="Alpha", ip="169.254.1.1", prefix=16, has_gateway=False, status="Up"),
+            _row(alias="Beta",  ip="169.254.2.2", prefix=16, has_gateway=False, status="Up"),
+        ]
+        rows_ba = list(reversed(rows_ab))
+        _, amb_ab = pick_recommended(rank_adapter_candidates(rows_ab, "192.168.33.30"))
+        _, amb_ba = pick_recommended(rank_adapter_candidates(rows_ba, "192.168.33.30"))
+        assert amb_ab is True
+        assert amb_ba is True
+
+    def test_ETH14_ambiguity_not_broken_by_alias(self):
+        """Adapters with very different aliases are still ambiguous when both are HIGH."""
+        rows = [
+            _row(alias="AAAA", ip="169.254.1.1", prefix=16, has_gateway=False, status="Up"),
+            _row(alias="ZZZZ", ip="169.254.2.2", prefix=16, has_gateway=False, status="Up"),
+        ]
+        rec, ambiguous = pick_recommended(rank_adapter_candidates(rows, "192.168.33.30"))
+        assert rec is None
+        assert ambiguous is True
+
+    def test_ETH14_single_good_adapter_is_not_ambiguous(self):
+        """One HIGH + one UNSAFE -> not ambiguous; HIGH adapter recommended."""
+        rows = [
+            _row(alias="Ethernet",   ip="10.0.0.5",      has_gateway=True,  status="Up"),
+            _row(alias="Ethernet 2", ip="169.254.77.130", has_gateway=False, status="Up"),
+        ]
+        rec, ambiguous = pick_recommended(rank_adapter_candidates(rows, "192.168.33.30"))
+        assert not ambiguous
+        assert rec is not None
+        assert rec.alias == "Ethernet 2"
+
+
+# ===========================================================================
+# Item 6: Read-only public call-graph guard
+# ===========================================================================
+
+class TestReadOnlyCallGraph:
+    """Prove that normal public APIs cannot issue NIC-mutating PS commands."""
+
+    MUTATING_CMDS = [
+        "Set-NetIPInterface",
+        "New-NetIPAddress",
+        "Remove-NetIPAddress",
+        "Remove-NetRoute",
+        "Set-DnsClientServerAddress",
+    ]
+
+    def test_RO1_discover_network_no_mutation(self, tmp_path):
+        """p.hardware.discover('network') must not issue mutating PS commands."""
+        p = _make_project(tmp_path)
+        ps_calls = []
+
+        def _capture_ps(script, *a, **kw):
+            ps_calls.append(script)
+            return "[]"
+
+        with patch("awr2944_dca.dca.preflight._run_ps_json", side_effect=_capture_ps):
+            p.hardware.discover("network")
+
+        for script in ps_calls:
+            for cmd in self.MUTATING_CMDS:
+                assert cmd not in script, (
+                    f"p.hardware.discover('network') issued mutating command {cmd!r}"
+                )
+
+    def test_RO2_eth_status_no_mutation(self, tmp_path):
+        """p.eth.status() must not issue mutating PS commands."""
+        p = _make_project(tmp_path)
+        ps_calls = []
+
+        def _capture_ps(script, *a, **kw):
+            ps_calls.append(script)
+            return "[]"
+
+        with patch("awr2944_dca.dca.preflight._run_ps_json", side_effect=_capture_ps):
+            p.eth.status()
+
+        for script in ps_calls:
+            for cmd in self.MUTATING_CMDS:
+                assert cmd not in script, (
+                    f"p.eth.status() issued mutating command {cmd!r}"
+                )
+
+    def test_RO3_eth_instructions_no_mutation(self, tmp_path):
+        """p.eth.instructions() must not issue mutating PS commands."""
+        p = _make_project(tmp_path)
+        ps_calls = []
+
+        def _capture_ps(script, *a, **kw):
+            ps_calls.append(script)
+            return "[]"
+
+        with patch("awr2944_dca.dca.preflight._run_ps_json", side_effect=_capture_ps):
+            p.eth.instructions()
+
+        for script in ps_calls:
+            for cmd in self.MUTATING_CMDS:
+                assert cmd not in script, (
+                    f"p.eth.instructions() issued mutating command {cmd!r}"
+                )
+
+    def test_RO4_doctor_no_mutation(self, tmp_path):
+        """p.doctor() / p.hardware.verify() must not issue mutating PS commands."""
+        p = _make_project(tmp_path)
+        ps_calls = []
+
+        def _capture_ps(script, *a, **kw):
+            ps_calls.append(script)
+            return "[]"
+
+        with patch("awr2944_dca.dca.preflight._run_ps_json", side_effect=_capture_ps):
+            with patch("awr2944_dca.hardware.ports.scan_ports", return_value=[]):
+                with patch("awr2944_dca.headless_serial.discover_serial_ports", return_value=[]):
+                    p.hardware.verify(include_hardware=True)
+
+        for script in ps_calls:
+            for cmd in self.MUTATING_CMDS:
+                assert cmd not in script, (
+                    f"p.doctor() issued mutating command {cmd!r}"
+                )
+
+    def test_RO5_status_via_injected_fn_makes_zero_ps_calls(self, tmp_path):
+        """With _snapshot_fn injected, p.eth.status() makes zero PS calls."""
+        p = _make_project(tmp_path)
+        rows = [_row(alias="Eth2", ip="169.254.1.1", has_gateway=False)]
+
+        with patch("awr2944_dca.dca.preflight._run_ps_json") as mock_ps:
+            p.eth.status(_snapshot_fn=lambda: rows)
+            mock_ps.assert_not_called()

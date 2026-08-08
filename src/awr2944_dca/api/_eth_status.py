@@ -53,7 +53,8 @@ class AdapterCandidate:
     media_type:      str          # "802.3", "Native 802.11", etc.
     confidence:      str          # one of the CONF_* constants
     classification:  str          # human-readable label for display
-    owns_host_ip:    bool = False  # True when this adapter already holds the configured host IP
+    owns_host_ip:    bool = False  # True when this adapter holds the configured host IP
+    host_ip_prefix:  int  = -1    # prefix length of the matching host IP row (-1 if not found)
 
 
 # ---------------------------------------------------------------------------
@@ -443,6 +444,12 @@ def rank_adapter_candidates(
 
         owns_host_ip = bool(host_ip and host_ip in ips)
 
+        # Find the prefix length of the matching host IP row (for prefix validation)
+        host_ip_prefix = -1
+        if owns_host_ip and host_ip in ips:
+            idx = ips.index(host_ip)
+            host_ip_prefix = prefixes[idx] if idx < len(prefixes) else -1
+
         # Already correctly configured
         if owns_host_ip:
             confidence     = CONF_READY
@@ -471,7 +478,7 @@ def rank_adapter_candidates(
             alias=alias, description=desc, ipv4_addresses=ips, prefix_lengths=prefixes,
             link_state=link_state, mac_address=mac, has_gateway=has_gateway,
             media_type=media_type, confidence=confidence, classification=classification,
-            owns_host_ip=owns_host_ip,
+            owns_host_ip=owns_host_ip, host_ip_prefix=host_ip_prefix,
         ))
 
     # Sort: READY > HIGH > MEDIUM > LOW > UNSAFE > SKIP
@@ -518,26 +525,51 @@ def build_eth_status(cfg: "ProjectConfig", raw_adapters: list[dict]) -> Ethernet
     dca_ip      = cfg.portable.dca_ip
     config_port = cfg.portable.config_port
     data_port   = cfg.portable.data_port
+    # Expected prefix length for the configured host IP (default /24)
+    expected_prefix = getattr(cfg.portable, "host_ip_prefix", 24)
+    # ProjectConfig doesn't expose host_ip_prefix; use 24 as the canonical default
+    expected_prefix = 24
 
     candidates = rank_adapter_candidates(raw_adapters, host_ip)
     recommended, ambiguous = pick_recommended(candidates)
 
-    host_ip_present = any(c.owns_host_ip for c in candidates)
-    host_ip_adapter = next(
-        (c.alias for c in candidates if c.owns_host_ip), ""
+    # --- ready logic: IP present + correct prefix + no gateway on that adapter ---
+    ip_adapter    = next((c for c in candidates if c.owns_host_ip), None)
+    host_ip_present = ip_adapter is not None
+    host_ip_adapter = ip_adapter.alias if ip_adapter else ""
+
+    prefix_correct = (
+        ip_adapter is not None
+        and ip_adapter.host_ip_prefix == expected_prefix
     )
+    # An adapter with the correct IP but a default gateway is still unsafe
+    gateway_on_ip_adapter = ip_adapter is not None and ip_adapter.has_gateway
+
+    # True only when all three conditions hold
+    ready = host_ip_present and prefix_correct and not gateway_on_ip_adapter
 
     warnings: list[str] = []
     if not host_ip:
         warnings.append("host_ip is not configured in local.toml — run p.hardware.autodetect_serial(save=True) or edit .awr2944/local.toml")
-    unsafe_candidates = [c for c in candidates if c.confidence == CONF_UNSAFE]
+    if host_ip_present and not prefix_correct and ip_adapter:
+        actual = ip_adapter.host_ip_prefix
+        warnings.append(
+            f"Adapter '{ip_adapter.alias}' has host IP {host_ip} "
+            f"but prefix /{actual} does not match expected /{expected_prefix} — "
+            f"reconfigure to /{expected_prefix}"
+        )
+    if gateway_on_ip_adapter and ip_adapter:
+        warnings.append(
+            f"Adapter '{ip_adapter.alias}' has host IP {host_ip} "
+            "but also has a default gateway — this is a normal network NIC, "
+            "DO NOT use for DCA1000; assign the IP to a dedicated adapter"
+        )
+    unsafe_candidates = [c for c in candidates if c.confidence == CONF_UNSAFE and c is not ip_adapter]
     for c in unsafe_candidates:
         warnings.append(
             f"Adapter '{c.alias}' has a default gateway — "
             "DO NOT assign the DCA host IP to this adapter"
         )
-
-    ready = host_ip_present
 
     return EthernetStatusResult(
         host_ip_expected=host_ip,
