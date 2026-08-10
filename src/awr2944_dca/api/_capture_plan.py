@@ -24,7 +24,7 @@ if TYPE_CHECKING:
 def _resolve_dca_info(project: Any) -> dict:
     """Resolve DCA toolchain + network info from the canonical ProjectConfig.
 
-    **Modern-first, never partial-legacy mixing.**
+    **Modern-only — no legacy fallback.**
 
     If ANY of the four modern DCA toolchain fields (``dca_control_exe``,
     ``dca_record_exe``, ``rf_api_dll``, ``cf_json_path``) is set in
@@ -32,10 +32,11 @@ def _resolve_dca_info(project: Any) -> dict:
     incomplete.  This matches exactly what production ``run()`` would see via
     ``resolve_connection()``.
 
-    Legacy fallback to ``toolchain.local.json`` is permitted ONLY when ALL
-    four modern tool fields are blank/empty.  It exists solely for backward
-    compatibility with projects that were configured before Task 2; Task 5
-    will remove it.
+    When ALL four modern fields are blank, the result honestly reports them
+    as unconfigured.  Legacy ``toolchain.local.json`` is **not** consulted
+    by this function (removed in Task 5).  Legacy callers that need
+    ``toolchain.local.json`` should use ``CaptureApi._load_toolchain()``
+    directly.
 
     Returns a dict with both modern snapshot keys (used by
     ``CapturePlan.dca_config``) and legacy-compat keys (used only by
@@ -57,18 +58,10 @@ def _resolve_dca_info(project: Any) -> dict:
         rf_api_dll  = modern_dll
         cf_json_raw = modern_cf_json
     else:
-        # Case A: ALL four modern fields blank — try legacy toolchain.local.json.
+        # ALL four modern fields blank — report honestly as unconfigured.
+        # Legacy toolchain.local.json is NOT consulted by the modern
+        # plan()/dry_run() path (removed in Task 5).
         control_exe = record_exe = rf_api_dll = cf_json_raw = ""
-        try:
-            from awr2944_dca.lab import CaptureApi
-            toolchain = CaptureApi(project)._load_toolchain()
-            if toolchain:
-                control_exe = toolchain.get("dca_cli_control_exe", "") or ""
-                record_exe  = toolchain.get("dca_cli_record_exe",  "") or ""
-                rf_api_dll  = toolchain.get("rf_api_dll",          "") or ""
-                cf_json_raw = toolchain.get("dca_cli_cf_json",     "") or ""
-        except Exception:
-            pass
 
     # Resolve the runtime cf.json path (same existence-check logic as old dry_run).
     cf_json_runtime = "NOT_CONFIGURED"

@@ -140,7 +140,12 @@ class TestCaptureApiIntegration:
             assert mock_run.call_args.kwargs["dca_cli"] is None
 
     def test_dry_run_includes_dca_paths(self, tmp_path):
-        """Dry run must include DCA executable and config path resolution."""
+        """Dry run must include DCA executable and config path keys.
+
+        With blank modern DCA fields in local.toml, the modern dry_run()
+        reports NOT_CONFIGURED — it does not fall back to legacy
+        toolchain.local.json (Task 5).
+        """
         proj_dir = _make_minimal_project(tmp_path)
         _make_toolchain_config(proj_dir)
         
@@ -157,7 +162,8 @@ class TestCaptureApiIntegration:
         assert "dca_config_source" in plan
         assert "dca_config_runtime_path" in plan
         assert plan["hardware_touched"] is False
-        assert plan["dca_control_executable"] != "NOT_CONFIGURED"
+        # Modern DCA fields are blank in local.toml → NOT_CONFIGURED
+        assert plan["dca_control_executable"] == "NOT_CONFIGURED"
 
     def test_no_mmws_imports_during_capture_api_construction(self, tmp_path):
         """Verify no mmws modules are imported when using CaptureApi."""
@@ -224,10 +230,12 @@ class TestProductionCaptureConstruction:
         assert tc is not None
         assert tc.get("dca_cli_control_exe") is not None
         
-        # 5. DCA config-path resolution (dry-run validates paths)
+        # 5. DCA config-path resolution (dry-run uses modern TOML config only)
+        #    Modern DCA fields are blank in local.toml → NOT_CONFIGURED
+        #    (Task 5: legacy toolchain.local.json is NOT consulted by dry_run)
         plan = api.dry_run(profile="smoke_v1", frames=9, guard_frames=1)
-        assert plan["dca_control_executable"] != "NOT_CONFIGURED"
-        assert plan["dca_config_source"] != "NOT_CONFIGURED"
+        assert plan["dca_control_executable"] == "NOT_CONFIGURED"
+        assert plan["dca_config_source"] == "NOT_CONFIGURED"
         
         # 6. No mmws contamination
         mmws_imports = [k for k in sys.modules if k.startswith("awr2944_dca.mmws")]

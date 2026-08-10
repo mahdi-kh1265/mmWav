@@ -281,20 +281,27 @@ class TestCapturePlanConsistencyVsRun:
 
 
 class TestCapturePlanLegacyCompat:
-    """CP-LC — legacy toolchain.local.json fallback preserved for legacy projects."""
+    """CP-LC — Task 5: modern plan()/dry_run() never consults legacy toolchain."""
 
-    def test_CPLC_blank_modern_fields_uses_legacy_toolchain(self, tmp_path):
-        """With all modern DCA fields blank, _resolve_dca_info() falls back to legacy."""
+    def test_CPLC_blank_modern_fields_no_legacy_fallback(self, tmp_path):
+        """With all modern DCA fields blank, _resolve_dca_info() reports NOT_CONFIGURED
+        even when legacy toolchain.local.json exists."""
         p = _make_modern_project(tmp_path)  # blank DCA tool fields in local.toml
-        # Write legacy toolchain.local.json
+        # Write legacy toolchain.local.json with valid-looking values
         _make_toolchain_json(
             tmp_path,
             control_exe="C:\\ti\\PostProc\\DCA1000EVM_CLI_Control.exe",
             cf_json="C:\\ti\\PostProc\\cf.json",
         )
-        # dry_run should report the legacy paths
+        # Modern plan()/dry_run() must NOT import legacy values
         result = p.capture.dry_run("smoke_v1", frames=8, guard_frames=1)
-        assert result["dca_control_executable"] == "C:\\ti\\PostProc\\DCA1000EVM_CLI_Control.exe"
+        assert result["dca_control_executable"] == "NOT_CONFIGURED"
+        assert result["dca_config_source"] == "NOT_CONFIGURED"
+
+        plan = p.capture.plan("smoke_v1", frames=8, guard_frames=1)
+        snap = plan.dca_config
+        assert snap["dca_control_exe"] == ""
+        assert snap["cf_json_path"] == ""
 
     def test_CPLC_partial_modern_fields_no_legacy_fallback(self, tmp_path):
         """With ANY modern field set, legacy toolchain is NOT consulted."""
@@ -311,8 +318,8 @@ class TestCapturePlanLegacyCompat:
         assert result["dca_control_executable"] == "C:\\modern\\control.exe"
         assert result["dca_config_source"] == "NOT_CONFIGURED"  # cf_json blank in modern
 
-    def test_CPLC_plan_to_dict_equals_dry_run_for_legacy_project(self, tmp_path):
-        """Exact equality still holds for legacy-toolchain projects."""
+    def test_CPLC_plan_to_dict_equals_dry_run_for_blank_project(self, tmp_path):
+        """Exact equality still holds when all modern DCA fields are blank."""
         p = _make_modern_project(tmp_path)
         _make_toolchain_json(
             tmp_path,
@@ -322,3 +329,32 @@ class TestCapturePlanLegacyCompat:
         plan = p.capture.plan("smoke_v1", frames=8, guard_frames=1)
         dr   = p.capture.dry_run("smoke_v1", frames=8, guard_frames=1)
         assert plan.to_dict() == dr
+
+    def test_CPLC_monkeypatch_guard_legacy_never_called(self, tmp_path, monkeypatch):
+        """Poison CaptureApi._load_toolchain to prove modern path never touches it.
+
+        If the modern plan()/dry_run() path were to call _load_toolchain,
+        this test would raise AssertionError.
+        """
+        from awr2944_dca.lab import CaptureApi
+
+        def _poisoned_load_toolchain(self):
+            raise AssertionError(
+                "Modern plan()/dry_run() must not call CaptureApi._load_toolchain"
+            )
+
+        monkeypatch.setattr(CaptureApi, "_load_toolchain", _poisoned_load_toolchain)
+
+        p = _make_modern_project(tmp_path)
+        # Write a legacy toolchain to prove it would have been found
+        _make_toolchain_json(tmp_path)
+
+        # Both plan() and dry_run() must complete without hitting the poison
+        plan = p.capture.plan("smoke_v1", frames=8, guard_frames=1)
+        dr   = p.capture.dry_run("smoke_v1", frames=8, guard_frames=1)
+
+        # And results are consistent
+        assert plan.to_dict() == dr
+        assert dr["dca_control_executable"] == "NOT_CONFIGURED"
+        assert plan.dca_config["dca_control_exe"] == ""
+
