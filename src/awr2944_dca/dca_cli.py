@@ -37,6 +37,7 @@ import json
 import logging
 import shutil
 import subprocess
+import tempfile
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -120,7 +121,12 @@ class DcaCli:
         self._record_exe = Path(record_exe)
         self._rf_api_dll = Path(rf_api_dll)
         self._cf_json = Path(cf_json_path)
-        self._working_dir = Path(working_dir) if working_dir else self._control_exe.parent
+        # CRITICAL: Do NOT use control_exe.parent as the working directory.
+        # TI's DCA1000EVM_CLI_Control.exe conflicts with RF_API.dll when cwd
+        # is the same directory as the executable — query_sys_status hangs for
+        # ~10s and returns "System is disconnected" even when hardware is fine.
+        # Any other directory works correctly.
+        self._working_dir = Path(working_dir) if working_dir else Path(tempfile.gettempdir())
         self._transcript: list[DcaCmdResult] = []
         self._dry_run = False
 
@@ -576,6 +582,57 @@ class DcaCli:
 
         return self._execute(args, command, timeout)
 
+    # TI CLI output patterns for output-semantic success detection.
+    # TI's DCA1000EVM_CLI_Control.exe uses non-standard exit codes:
+    #   - fpga_version always returns 1154 even on success
+    #   - query_sys_status returns 0 on success, 4294967291 (-5) on failure
+    #   - Other commands vary unpredictably
+    # Therefore, success is determined by stdout content, not exit code.
+    _TI_SUCCESS_PATTERNS: tuple[str, ...] = (
+        "System is connected",
+        "FPGA Version",
+        "Record process completed",
+        "Record FPGA Configure command",
+        "EEPROM write successful",
+        "Record Start command sent",
+        "Record Stop command sent",
+        "Reset AR device command sent",
+        "Reset FPGA command sent",
+        "Record delay configured",
+        "DCA1000EVM CLI Record",
+        "DCA1000EVM CLI Control",
+        "CLI DLL version",
+    )
+    _TI_FAILURE_PATTERNS: tuple[str, ...] = (
+        "disconnected",
+        "Error",
+        "Failure",
+        "Unable",
+        "error[",
+    )
+
+    def _classify_ti_success(self, stdout: str) -> bool:
+        """Determine success from TI CLI stdout, ignoring exit code.
+
+        TI's DCA1000EVM_CLI_Control.exe uses non-standard, unreliable
+        process return codes (e.g. fpga_version always returns 1154,
+        query_sys_status returns 4294967291 on failure).  We classify
+        success exclusively from the output text.
+
+        Returns True only when stdout matches a known-good pattern AND
+        does not contain any failure indicator.
+        """
+        # Failure takes precedence: if any failure pattern matches, fail.
+        for pat in self._TI_FAILURE_PATTERNS:
+            if pat in stdout:
+                return False
+        # Then check for a known-good pattern.
+        for pat in self._TI_SUCCESS_PATTERNS:
+            if pat in stdout:
+                return True
+        # Unknown output — fall back to exit-code == 0.
+        return False
+
     def _execute(self, args: list[str], command: str,
                  timeout: float) -> DcaCmdResult:
         """Execute a subprocess and capture results."""
@@ -593,11 +650,10 @@ class DcaCli:
             stdout = proc.stdout.strip()
             stderr = proc.stderr.strip()
 
-            # Determine success from output text and return code
-            success = proc.returncode == 0
-            # Also check for explicit failure messages
-            if "Error" in stdout or "Failure" in stdout or "Unable" in stdout:
-                success = False
+            # Determine success from TI CLI output text (not exit code).
+            # TI's CLI uses non-standard return codes (e.g. fpga_version
+            # always returns 1154 on success).
+            success = self._classify_ti_success(stdout)
 
             result = DcaCmdResult(
                 command=command,
