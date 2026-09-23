@@ -135,12 +135,65 @@ def run_capture(
         data_port=4098
     )
 
+    dca_armed = False  # Track whether DCA recording was actually armed
+
     try:
         # 1. Ensure Radar is Idle & Send Config (excluding sensorStart)
         failure_stage = "uart_config"
         logger.info("Configuring radar via UART...")
         with AwrUartConnection(com_port, 115200) as conn:
+            # ---- UART Prompt Synchronization ----
+            # Opening the serial port may toggle DTR, which can trigger an
+            # AWR2944 board reset/reboot.  The boot banner (several lines ending
+            # in "mmwDemo:/>") streams for up to ~5 s.  If we send commands
+            # immediately, the boot banner text is misinterpreted as the response
+            # to the first config command (e.g. flushCfg).
+            #
+            # Fix: synchronize to a stable prompt BEFORE sending any command.
+            # This mirrors the proven logic in _probe_uart_prompt:
+            #   1. Drain any stale/boot data sitting in the OS receive buffer
+            #   2. Send a bare newline (benign wake-up)
+            #   3. Wait for mmwDemo:/> with a generous timeout
+            #   4. Only then proceed with sensorStop + config
+            logger.info("Synchronizing to mmwDemo:/> prompt...")
+            conn._serial.reset_input_buffer()
+            conn._serial.write(b"\n")
+            conn._record("TX", "<sync newline>")
+            sync_text = conn.read_until_prompt(timeout=10.0)
+            logger.info("Prompt sync received: %r", sync_text[-80:] if sync_text else "")
+
+            if "mmwDemo:/>" not in sync_text:
+                raise RuntimeError(
+                    f"UART prompt synchronization failed: did not receive "
+                    f"mmwDemo:/> within 10 s. Received: {sync_text!r}"
+                )
+
+            # Drain any trailing data after the prompt
+            conn._serial.reset_input_buffer()
+
+            # Now the CLI is ready — send sensorStop to ensure idle state
             conn.send_command("sensorStop")
+
+            # ---- Post-sensorStop re-synchronization ----
+            # On the AWR2944, sensorStop can trigger a full board reboot
+            # (QSPI bootloader → application restart → new mmwDemo:/>).
+            # send_command sees "Done" and returns immediately, but the
+            # reboot text is still streaming.  Without a second sync,
+            # the next config command (e.g. flushCfg) collects the tail
+            # of the boot banner instead of its own response.
+            logger.info("Re-synchronizing after sensorStop (may absorb reboot)...")
+            conn._serial.reset_input_buffer()
+            conn._serial.write(b"\n")
+            conn._record("TX", "<post-sensorStop sync>")
+            post_stop_text = conn.read_until_prompt(timeout=10.0)
+            logger.info("Post-sensorStop sync: %r", post_stop_text[-80:] if post_stop_text else "")
+
+            if "mmwDemo:/>" not in post_stop_text:
+                raise RuntimeError(
+                    f"Post-sensorStop re-sync failed: did not receive "
+                    f"mmwDemo:/> within 10 s. Received: {post_stop_text!r}"
+                )
+            conn._serial.reset_input_buffer()
             
             for line in sdk_cli_commands:
                 line = line.strip()
@@ -194,6 +247,7 @@ def run_capture(
             logger.info("Arming DCA via UDP start_record...")
             if not dca.start_record():
                 raise CaptureNetworkError("Failed to arm DCA (timeout on 0x0005).")
+            dca_armed = True
 
             # 5. Signal trigger and send sensorStart
             failure_stage = "trigger"
@@ -239,11 +293,16 @@ def run_capture(
             
         captured_native_bytes = receiver.received_bytes
         
-        # Stop DCA
-        try:
-            dca.stop_record()
-        except Exception as e:
-            logger.error(f"Failed to stop DCA during cleanup: {e}")
+        # Stop DCA — only if recording was actually armed (0x0005 succeeded).
+        # Sending stop_record (0x0006) when DCA was never armed causes a
+        # spurious UDP timeout that masks the real failure.
+        if dca_armed:
+            try:
+                dca.stop_record()
+            except Exception as e:
+                logger.error(f"Failed to stop DCA during cleanup: {e}")
+        else:
+            logger.debug("Skipping DCA stop_record: recording was never armed.")
             
         # Stop Radar
         try:
