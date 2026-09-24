@@ -459,6 +459,159 @@ class DcaCli:
         """Stop DCA1000 recording."""
         return self._run_control("stop_record")
 
+    def arm_record(self, timeout_s: float = 10.0) -> DcaCmdResult:
+        """Send the DCA1000 ARM command (0x0005) via TI CLI start_record.
+
+        Unlike :meth:`start_record`, this method does NOT attempt to keep
+        ``DCA1000EVM_CLI_Record.exe`` alive — it only cares that the
+        ARM command succeeds.  Any spawned Record.exe child is killed
+        immediately because the Python ``UdpReceiverThread`` owns the
+        data port instead.
+
+        The TI executable has Windows Firewall allow rules that the
+        Python process does not, so routing the ARM through the CLI
+        avoids the UDP reply being dropped by the firewall.
+
+        Uses file-based stdout redirection (not PIPE) because CLI_Control
+        spawns CLI_Record as a child that inherits pipe handles, causing
+        ``communicate()`` to block indefinitely even after killing the
+        parent.
+        """
+        if self._dry_run:
+            return DcaCmdResult(
+                command="arm_record", args=[], returncode=0,
+                stdout="[DRY RUN] arm_record",
+                stderr="", success=True, elapsed_s=0.0,
+                exe_path=str(self._control_exe),
+            )
+
+        args = [str(self._control_exe), "start_record", str(self._cf_json)]
+        t_start = time.time()
+
+        # IMPORTANT: Use the control exe's parent directory (PostProc) as cwd.
+        # This is required because:
+        # 1. CLI_Control needs to find CLI_Record.exe in the same directory
+        # 2. Without CLI_Record, the CLI hangs or fails silently
+        # 3. The RF_API.dll conflict that affects query_sys_status does NOT
+        #    affect start_record — it's safe to use PostProc as cwd here.
+        #
+        # We use Popen with file-based stdout (NOT PIPE) because:
+        # CLI_Control spawns CLI_Record.exe as a child.  If stdout is PIPE,
+        # Record.exe inherits the pipe handle, and communicate()/run()
+        # block until Record.exe exits — even though Control.exe exits
+        # immediately after arming.  File-based redirection avoids this.
+        arm_cwd = str(self._control_exe.parent)
+
+        stdout_file = Path(arm_cwd) / "arm_record_stdout.tmp"
+        stderr_file = Path(arm_cwd) / "arm_record_stderr.tmp"
+
+        try:
+            with open(stdout_file, "w") as out_f, \
+                 open(stderr_file, "w") as err_f:
+                proc = subprocess.Popen(
+                    args,
+                    cwd=arm_cwd,
+                    stdout=out_f,
+                    stderr=err_f,
+                    stdin=subprocess.DEVNULL,
+                )
+
+                # Poll for CLI exit or ARM result in stdout file.
+                # Control.exe writes "Start Record command : Success" before
+                # spawning Record.exe, so it appears in the file quickly.
+                deadline = time.time() + timeout_s
+                armed = False
+                while time.time() < deadline:
+                    rc = proc.poll()
+                    if rc is not None:
+                        break
+                    time.sleep(0.3)
+                    # Check if ARM result has appeared in stdout file
+                    try:
+                        partial = stdout_file.read_text(errors="replace").strip()
+                        if partial:
+                            armed = self._classify_ti_success(partial)
+                            if armed:
+                                break
+                            # If we got failure output, no need to wait more
+                            for fp in self._TI_FAILURE_PATTERNS:
+                                if fp in partial:
+                                    break
+                    except OSError:
+                        pass
+
+                # Kill the CLI tree (Control + any spawned Record.exe)
+                if proc.poll() is None:
+                    proc.kill()
+                    try:
+                        proc.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        pass
+
+            # Read final output
+            stdout = ""
+            stderr = ""
+            try:
+                stdout = stdout_file.read_text(errors="replace").strip()
+            except OSError:
+                pass
+            try:
+                stderr = stderr_file.read_text(errors="replace").strip()
+            except OSError:
+                pass
+
+            elapsed = time.time() - t_start
+            success = self._classify_ti_success(stdout)
+
+            result = DcaCmdResult(
+                command="arm_record",
+                args=args,
+                returncode=proc.returncode if proc.returncode is not None else -1,
+                stdout=stdout,
+                stderr=stderr,
+                success=success,
+                elapsed_s=round(elapsed, 3),
+                exe_path=str(self._control_exe),
+            )
+
+        except (FileNotFoundError, OSError) as e:
+            result = DcaCmdResult(
+                command="arm_record",
+                args=args,
+                returncode=-1,
+                stdout="",
+                stderr=f"Failed to launch CLI: {e}",
+                success=False,
+                elapsed_s=round(time.time() - t_start, 3),
+                exe_path=str(self._control_exe),
+            )
+
+        # Clean up temp files
+        for f in (stdout_file, stderr_file):
+            try:
+                f.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+        # Kill any spawned Record.exe — we don't want it competing on port 4098
+        record_pid = self.find_record_process()
+        if record_pid:
+            logger.info("arm_record: killing spawned Record.exe PID=%d", record_pid)
+            try:
+                subprocess.run(
+                    ["taskkill", "/PID", str(record_pid), "/F"],
+                    capture_output=True, timeout=5,
+                )
+            except Exception:
+                pass
+
+        self._transcript.append(result)
+        logger.info(
+            "arm_record: success=%s stdout=%r elapsed=%.1fs",
+            result.success, result.stdout, result.elapsed_s,
+        )
+        return result
+
     def fpga_version(self) -> DcaCmdResult:
         """Read FPGA firmware version."""
         return self._run_control("fpga_version")
@@ -593,12 +746,16 @@ class DcaCli:
         "FPGA Version",
         "Record process completed",
         "Record FPGA Configure command",
+        "FPGA Configuration command : Success",
         "EEPROM write successful",
         "Record Start command sent",
+        "Start Record command : Success",
         "Record Stop command sent",
         "Reset AR device command sent",
         "Reset FPGA command sent",
+        "Reset FPGA command : Success",
         "Record delay configured",
+        "Configure Record command : Success",
         "DCA1000EVM CLI Record",
         "DCA1000EVM CLI Control",
         "CLI DLL version",

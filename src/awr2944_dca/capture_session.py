@@ -135,6 +135,77 @@ def run_capture(
         data_port=4098
     )
 
+    # ------------------------------------------------------------------
+    # Helper: wait for a possible async reboot after certain commands
+    # ------------------------------------------------------------------
+    def _await_async_reboot(
+        conn: AwrUartConnection,
+        trigger_cmd: str,
+        settle_s: float = 2.0,
+        reboot_timeout_s: float = 15.0,
+    ) -> str | None:
+        """Wait for a possible async QSPI reboot and re-sync to prompt.
+
+        Some AWR2944 CLI commands (notably ``dfeDataOutputMode 1``) return
+        ``Done`` + prompt normally, but up to ~1 s later trigger an
+        asynchronous QSPI bootloader restart.  If the next command is sent
+        before the reboot completes, the boot banner is consumed as that
+        command's response, causing false rejection.
+
+        Algorithm:
+          1. Wait *settle_s* seconds, polling for unsolicited bytes.
+          2. If bytes arrive → a reboot is in progress → consume the full
+             stream until ``mmwDemo:/>`` with *reboot_timeout_s* ceiling.
+          3. If no bytes arrive during settle → no reboot, return ``None``.
+
+        Returns the consumed reboot text (str) or ``None`` if no reboot.
+        Raises ``RuntimeError`` if a reboot begins but never reaches prompt.
+        """
+        import time as _time
+
+        old_timeout = conn._serial.timeout
+        collected = b""
+        deadline = _time.time() + settle_s
+
+        # Step 1: poll for unsolicited data during the settle window
+        conn._serial.timeout = 0.25  # short polling interval
+        while _time.time() < deadline:
+            chunk = conn._serial.read(1024)
+            if chunk:
+                collected += chunk
+            if not chunk and collected:
+                # Data arrived and stream paused — reboot might be complete
+                # but keep polling until deadline to catch slow starters
+                pass
+
+        conn._serial.timeout = old_timeout
+
+        if not collected:
+            # No async data arrived within settle window → no reboot
+            logger.debug("No async reboot after %s (settle %.2fs clean).",
+                         trigger_cmd, settle_s)
+            return None
+
+        # Step 2: reboot detected — read remaining stream until prompt
+        logger.info("Async reboot detected after %s (%d bytes during settle) "
+                     "— consuming boot stream...", trigger_cmd, len(collected))
+        conn._serial.reset_input_buffer()
+        conn._serial.write(b"\n")
+        conn._record("TX", f"<post-{trigger_cmd} reboot sync>")
+        reboot_text = conn.read_until_prompt(timeout=reboot_timeout_s)
+
+        if "mmwDemo:/>" not in reboot_text:
+            raise RuntimeError(
+                f"Async reboot after {trigger_cmd} began but never returned "
+                f"to mmwDemo:/> within {reboot_timeout_s}s. "
+                f"Received: {reboot_text[-200:]!r}"
+            )
+
+        conn._serial.reset_input_buffer()
+        logger.info("Post-%s reboot consumed (%d chars). Prompt recovered.",
+                     trigger_cmd, len(reboot_text))
+        return reboot_text
+
     dca_armed = False  # Track whether DCA recording was actually armed
 
     try:
@@ -168,7 +239,34 @@ def run_capture(
                     f"mmwDemo:/> within 10 s. Received: {sync_text!r}"
                 )
 
-            # Drain any trailing data after the prompt
+            # Drain any trailing data after the prompt.
+            # Opening the serial port asserts DTR which triggers a hard
+            # reset via the XDS110 debugger.  The QSPI boot banner can
+            # stream for several seconds; read_until_prompt above catches
+            # the first mmwDemo:/> but more data may follow.  Poll for
+            # 2 s to ensure ALL residual boot data is consumed.
+            conn._serial.reset_input_buffer()
+            import time as _time
+            _drain_deadline = _time.time() + 2.0
+            _drain_bytes = 0
+            _orig_to = conn._serial.timeout
+            conn._serial.timeout = 0.25
+            while _time.time() < _drain_deadline:
+                _chunk = conn._serial.read(4096)
+                if _chunk:
+                    _drain_bytes += len(_chunk)
+            conn._serial.timeout = _orig_to
+            if _drain_bytes:
+                logger.info("Post-open drain consumed %d residual bytes.", _drain_bytes)
+            # Re-sync to prompt after drain
+            conn._serial.reset_input_buffer()
+            conn._serial.write(b"\n")
+            conn._record("TX", "<post-drain sync>")
+            _drain_sync = conn.read_until_prompt(timeout=5.0)
+            if "mmwDemo:/>" not in _drain_sync:
+                raise RuntimeError(
+                    f"Post-drain re-sync failed: {_drain_sync!r}"
+                )
             conn._serial.reset_input_buffer()
 
             # Now the CLI is ready — send sensorStop to ensure idle state
@@ -195,6 +293,8 @@ def run_capture(
                 )
             conn._serial.reset_input_buffer()
             
+            config_restarted = False
+            
             for line in sdk_cli_commands:
                 line = line.strip()
                 if not line or line.startswith("%") or line == "sensorStart" or line == "sensorStop":
@@ -214,14 +314,71 @@ def run_capture(
                 if not any("Done" in text for text in res.response_lines) and not any("Done" in text for text in [resp_text]):
                     raise RuntimeError(f"Radar command incomplete (no Done): {line}\nResponse: {res.response_lines}")
 
-            # 2. DCA Full Initialization (if provided)
+                # ---- dfeDataOutputMode async reboot boundary ----
+                # dfeDataOutputMode 1 returns Done + prompt normally, but
+                # up to ~1 s later triggers an asynchronous QSPI bootloader
+                # restart.  The reboot IS the firmware applying the DFE
+                # mode — after the reboot completes, the mode is active.
+                # Consume the reboot and continue with remaining commands.
+                if line.startswith("dfeDataOutputMode"):
+                    _await_async_reboot(conn, line)
             if dca_cli:
                 failure_stage = "dca_initialization"
                 logger.info("Resetting DCA FPGA...")
                 res_reset = dca_cli.reset_fpga()
-                validate_dca_cmd_result(res_reset, "reset_fpga")
-                logger.info("DCA FPGA reset accepted.")
-                
+
+                if res_reset.success:
+                    logger.info("DCA FPGA reset accepted.")
+                else:
+                    # Detect the known transient-reset signature:
+                    # rc == -5 (unsigned 4294967291) AND stdout mentions
+                    # "Timeout Error" or "System disconnected".
+                    _rc = res_reset.returncode
+                    _stdout_lower = res_reset.stdout.lower()
+                    _is_transient = (
+                        _rc in (-5, 4294967291)
+                        and ("timeout error" in _stdout_lower
+                             or "system disconnected" in _stdout_lower)
+                    )
+
+                    if not _is_transient:
+                        # Not the known transient signature → fail immediately
+                        validate_dca_cmd_result(res_reset, "reset_fpga")
+
+                    # Transient reset disconnect detected — poll for recovery
+                    logger.warning(
+                        "reset_fpga returned transient disconnect "
+                        "(rc=%s, stdout=%r); polling for DCA recovery...",
+                        _rc, res_reset.stdout,
+                    )
+                    _recovered = False
+                    for _poll in range(5):
+                        time.sleep(1.0)
+                        _status = dca_cli.query_sys_status()
+                        if _status.success:
+                            _recovered = True
+                            break
+                        logger.debug(
+                            "DCA recovery poll %d/5: not yet "
+                            "(rc=%s, stdout=%r)",
+                            _poll + 1, _status.returncode, _status.stdout,
+                        )
+
+                    if not _recovered:
+                        # DCA never came back — fail with original reset diag
+                        raise DcaInitializationError(
+                            f"reset_fpga failed (rc={res_reset.returncode}) "
+                            f"and DCA did not recover within 5 s\n"
+                            f"  exe: {res_reset.exe_path}\n"
+                            f"  stdout: {res_reset.stdout}\n"
+                            f"  stderr: {res_reset.stderr}"
+                        )
+
+                    logger.info(
+                        "reset_fpga did not acknowledge, but DCA recovered "
+                        "and is connected; continuing."
+                    )
+
                 time.sleep(1.0)
                 
                 logger.info("Configuring DCA FPGA/network...")
@@ -244,9 +401,32 @@ def run_capture(
 
             # 4. Arm DCA
             failure_stage = "dca_arm"
-            logger.info("Arming DCA via UDP start_record...")
-            if not dca.start_record():
-                raise CaptureNetworkError("Failed to arm DCA (timeout on 0x0005).")
+            if dca_cli:
+                # Route ARM through TI CLI executable — its Windows Firewall
+                # allow rules let the DCA1000 UDP reply through, whereas
+                # Python's inbound UDP is blocked by a per-executable rule.
+                logger.info("Arming DCA via TI CLI arm_record...")
+                # Customize cf.json so fileBasePath is valid for this capture
+                _capture_cf = output_dir / "cf_capture.json"
+                from awr2944_dca.dca_cli import DcaCli as _DcaCli
+                _DcaCli.copy_and_customize_config(
+                    dca_cli._cf_json, _capture_cf,
+                    file_base_path=str(output_dir),
+                )
+                _orig_cf = dca_cli._cf_json
+                dca_cli._cf_json = _capture_cf
+                arm_result = dca_cli.arm_record()
+                dca_cli._cf_json = _orig_cf
+                if not arm_result.success:
+                    raise CaptureNetworkError(
+                        f"Failed to arm DCA via CLI: {arm_result.stdout} "
+                        f"(rc={arm_result.returncode})"
+                    )
+            else:
+                # Fallback: raw UDP (may fail under restrictive firewalls)
+                logger.info("Arming DCA via UDP start_record...")
+                if not dca.start_record():
+                    raise CaptureNetworkError("Failed to arm DCA (timeout on 0x0005).")
             dca_armed = True
 
             # 5. Signal trigger and send sensorStart
@@ -298,7 +478,10 @@ def run_capture(
         # spurious UDP timeout that masks the real failure.
         if dca_armed:
             try:
-                dca.stop_record()
+                if dca_cli:
+                    dca_cli.stop_record()
+                else:
+                    dca.stop_record()
             except Exception as e:
                 logger.error(f"Failed to stop DCA during cleanup: {e}")
         else:
