@@ -48,6 +48,21 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# TI CLI Constraints
+# ---------------------------------------------------------------------------
+
+# TI's DCA1000EVM_CLI_Control.exe has a hard ~98-character buffer for the
+# cf.json path argument (argv[2]).  Paths >= 100 characters are silently
+# truncated, causing the CLI to parse overflow bytes as a spurious second
+# argument and return "Invalid Command (…). error[-4048]".
+#
+# Empirically verified on DCA1000EVM_CLI_Control.exe v3.1.4.4:
+#   len=98  → Success
+#   len=100 → Invalid Command (). error[-4048]
+TI_CLI_MAX_ARG_PATH_LEN = 98
+
+
+# ---------------------------------------------------------------------------
 # Data classes
 # ---------------------------------------------------------------------------
 
@@ -691,6 +706,51 @@ class DcaCli:
             "dest_sha256": dest_sha,
             "changes": changes,
         }
+
+    @staticmethod
+    def make_temp_cf_json(
+        source_cf_json: str | Path,
+        file_base_path: str,
+        *,
+        file_prefix: str | None = None,
+    ) -> Path:
+        """Create a uniquely-named customized cf.json in a short temp path.
+
+        TI's DCA1000EVM_CLI_Control.exe silently truncates argv[2] at
+        ~98 characters, so the cf.json must live in a short directory.
+        This method writes to ``tempfile.gettempdir()`` with a short
+        unique filename (``dca_XXXXXXXX.json``).
+
+        The caller is responsible for cleaning up the returned path after
+        use (e.g. in a ``finally`` block).
+
+        Raises
+        ------
+        ValueError
+            If the generated absolute path exceeds
+            :data:`TI_CLI_MAX_ARG_PATH_LEN`.
+        """
+        import uuid
+        short_id = uuid.uuid4().hex[:8]
+        fname = f"dca_{short_id}.json"
+        dest = Path(tempfile.gettempdir()) / fname
+
+        abs_len = len(str(dest))
+        if abs_len > TI_CLI_MAX_ARG_PATH_LEN:
+            raise ValueError(
+                f"TI CLI cf.json path too long ({abs_len} chars, "
+                f"limit {TI_CLI_MAX_ARG_PATH_LEN}): {dest}"
+            )
+
+        DcaCli.copy_and_customize_config(
+            source_cf_json, dest,
+            file_base_path=file_base_path,
+            file_prefix=file_prefix,
+        )
+        logger.debug(
+            "Created temp cf.json (%d chars): %s", abs_len, dest,
+        )
+        return dest
 
     # -- Transcript ---------------------------------------------------------
 

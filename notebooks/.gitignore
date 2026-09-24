@@ -1,0 +1,18 @@
+# AWR2944 Ignore rules
+# Machine-local configuration
+.awr2944/local.toml
+# Capture data
+captures/
+# Binary artifacts
+*.bin
+*.dat
+*.mat
+*.npy
+*.npz
+# Executed notebooks
+*_executed.ipynb
+*_output.ipynb
+# Temporary artifacts
+__pycache__/
+*.pyc
+.pytest_cache/

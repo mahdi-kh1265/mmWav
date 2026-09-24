@@ -1,0 +1,14 @@
+[project]
+name = "notebooks"
+id = "5daa5642b5a0"
+schema_version = 2
+
+[defaults]
+frames = 9
+guard_frames = 1
+profile = "smoke_v1"
+
+[network]
+dca_ip = "192.168.33.180"
+config_port = 4096
+data_port = 4098

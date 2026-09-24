@@ -1,4 +1,5 @@
 import hashlib
+import tempfile
 import time
 import shutil
 import logging
@@ -11,7 +12,7 @@ from awr2944_dca.headless_serial import AwrUartConnection
 from awr2944_dca.capture_manifest import CaptureManifest, profile_to_manifest_dict
 from awr2944_dca.dsp.config import RadarProfile
 from awr2944_dca.awr2944_adc import expected_raw_dca_bytes, active_payload_bytes, AWR2944AdcLayout
-from awr2944_dca.dca_cli import DcaCmdResult
+from awr2944_dca.dca_cli import DcaCli, DcaCmdResult, TI_CLI_MAX_ARG_PATH_LEN
 
 logger = logging.getLogger(__name__)
 
@@ -207,6 +208,7 @@ def run_capture(
         return reboot_text
 
     dca_armed = False  # Track whether DCA recording was actually armed
+    _temp_cf = None     # Temp cf.json path for cleanup
 
     try:
         # 1. Ensure Radar is Idle & Send Config (excluding sensorStart)
@@ -406,17 +408,19 @@ def run_capture(
                 # allow rules let the DCA1000 UDP reply through, whereas
                 # Python's inbound UDP is blocked by a per-executable rule.
                 logger.info("Arming DCA via TI CLI arm_record...")
-                # Customize cf.json so fileBasePath is valid for this capture
-                _capture_cf = output_dir / "cf_capture.json"
-                from awr2944_dca.dca_cli import DcaCli as _DcaCli
-                _DcaCli.copy_and_customize_config(
-                    dca_cli._cf_json, _capture_cf,
+                # Create a customized cf.json in a SHORT temp path.
+                # TI's CLI silently truncates argv[2] at 98 characters,
+                # so we cannot use the (long) capture output_dir.
+                _temp_cf = DcaCli.make_temp_cf_json(
+                    dca_cli._cf_json,
                     file_base_path=str(output_dir),
                 )
                 _orig_cf = dca_cli._cf_json
-                dca_cli._cf_json = _capture_cf
-                arm_result = dca_cli.arm_record()
-                dca_cli._cf_json = _orig_cf
+                dca_cli._cf_json = _temp_cf
+                try:
+                    arm_result = dca_cli.arm_record()
+                finally:
+                    dca_cli._cf_json = _orig_cf
                 if not arm_result.success:
                     raise CaptureNetworkError(
                         f"Failed to arm DCA via CLI: {arm_result.stdout} "
@@ -474,18 +478,32 @@ def run_capture(
         captured_native_bytes = receiver.received_bytes
         
         # Stop DCA — only if recording was actually armed (0x0005 succeeded).
-        # Sending stop_record (0x0006) when DCA was never armed causes a
-        # spurious UDP timeout that masks the real failure.
+        # Always use raw UDP 0x0006 (fire-and-forget) for the hardware disarm.
+        # The CLI stop_record only checks if Record.exe is running on the PC;
+        # it does NOT send 0x0006 to the DCA when Record.exe was already killed
+        # by arm_record().  Raw UDP 0x0006 reaches the DCA even if the inbound
+        # ACK is blocked by firewall — the DCA disarms on receipt regardless.
         if dca_armed:
-            try:
-                if dca_cli:
-                    dca_cli.stop_record()
-                else:
-                    dca.stop_record()
-            except Exception as e:
-                logger.error(f"Failed to stop DCA during cleanup: {e}")
+            logger.info("Sending raw UDP 0x0006 STOP to DCA hardware...")
+            ack_received = dca.stop_record()
+            if ack_received:
+                logger.info("DCA 0x0006 STOP: sent and ACK received.")
+            else:
+                logger.info(
+                    "DCA 0x0006 STOP: sent but no ACK received (timeout). "
+                    "The outbound command was transmitted; DCA likely disarmed "
+                    "but ACK may have been dropped by default firewall policy."
+                )
         else:
             logger.debug("Skipping DCA stop_record: recording was never armed.")
+
+        # Clean up temp cf.json if one was created
+        if _temp_cf is not None:
+            try:
+                _temp_cf.unlink(missing_ok=True)
+                logger.debug("Cleaned up temp cf.json: %s", _temp_cf)
+            except OSError:
+                pass
             
         # Stop Radar
         try:

@@ -239,3 +239,249 @@ class TestFacadeIntegrationWithTiExitCodes:
 
         assert result.success is True
         assert "2.9" in result.version_string
+
+
+# ---------------------------------------------------------------------------
+# Reset FPGA success classification regression (live bug 2026-09-23)
+# ---------------------------------------------------------------------------
+
+class TestResetFpgaClassification:
+    """Regression: TI CLI emits 'Reset FPGA command : Success' on actual
+    FPGA reset, which differs from 'Reset FPGA command sent'.  Both must
+    classify as success.  Failure keywords must still take precedence.
+    """
+
+    def test_a_reset_fpga_success_string_is_success(self, cli: DcaCli):
+        """A – rc=0 + 'Reset FPGA command : Success' → success=True."""
+        proc = _make_proc_result(0, "Reset FPGA command : Success\n")
+        with patch("subprocess.run", return_value=proc):
+            result = cli.reset_fpga()
+        assert result.success is True
+
+    def test_a2_reset_fpga_command_sent_still_success(self, cli: DcaCli):
+        """Existing 'Reset FPGA command sent' variant still works."""
+        proc = _make_proc_result(0, "Reset FPGA command sent\n")
+        with patch("subprocess.run", return_value=proc):
+            result = cli.reset_fpga()
+        assert result.success is True
+
+    def test_b_reset_timeout_disconnected_is_failure(self, cli: DcaCli):
+        """B – 'Timeout Error! System disconnected' → success=False."""
+        proc = _make_proc_result(
+            4294967291,
+            "Reset FPGA :\nTimeout Error! System disconnected\n",
+        )
+        with patch("subprocess.run", return_value=proc):
+            result = cli.reset_fpga()
+        assert result.success is False
+
+    def test_c_failure_keyword_overrides_success_pattern(self, cli: DcaCli):
+        """C – stdout with both success and failure keywords → failure wins."""
+        proc = _make_proc_result(
+            0,
+            "Reset FPGA command : Success\nError: checksum mismatch\n",
+        )
+        with patch("subprocess.run", return_value=proc):
+            result = cli.reset_fpga()
+        assert result.success is False
+
+    def test_c2_disconnected_overrides_success_pattern(self, cli: DcaCli):
+        """C variant – 'disconnected' overrides any success pattern."""
+        proc = _make_proc_result(
+            0,
+            "Reset FPGA command : Success but System disconnected\n",
+        )
+        with patch("subprocess.run", return_value=proc):
+            result = cli.reset_fpga()
+        assert result.success is False
+
+    def test_d_existing_configure_fpga_unchanged(self, cli: DcaCli):
+        """D – configure_fpga classification unchanged."""
+        proc = _make_proc_result(0, "Record FPGA Configure command\n")
+        with patch("subprocess.run", return_value=proc):
+            result = cli.configure_fpga()
+        assert result.success is True
+
+    def test_d_existing_query_sys_status_unchanged(self, cli: DcaCli):
+        """D – query_sys_status classification unchanged."""
+        proc = _make_proc_result(0, "System is connected.\n")
+        with patch("subprocess.run", return_value=proc):
+            result = cli.query_sys_status()
+        assert result.success is True
+
+    def test_d_existing_fpga_version_unchanged(self, cli: DcaCli):
+        """D – fpga_version classification unchanged."""
+        proc = _make_proc_result(1154, "FPGA Version : 2.9 [Record]\n")
+        with patch("subprocess.run", return_value=proc):
+            result = cli.fpga_version()
+        assert result.success is True
+
+    def test_configure_fpga_success_variant(self, cli: DcaCli):
+        """'FPGA Configuration command : Success' → success=True."""
+        proc = _make_proc_result(0, "FPGA Configuration command : Success\n")
+        with patch("subprocess.run", return_value=proc):
+            result = cli.configure_fpga()
+        assert result.success is True
+
+    def test_configure_fpga_success_with_failure_keyword(self, cli: DcaCli):
+        """Failure keyword overrides configure_fpga success variant."""
+        proc = _make_proc_result(
+            0, "FPGA Configuration command : Success\nError: CRC\n",
+        )
+        with patch("subprocess.run", return_value=proc):
+            result = cli.configure_fpga()
+        assert result.success is False
+
+    def test_unknown_stdout_still_fails(self, cli: DcaCli):
+        """Unrecognised stdout without failure keywords → success=False."""
+        proc = _make_proc_result(0, "Something completely unexpected\n")
+        with patch("subprocess.run", return_value=proc):
+            result = cli.reset_fpga()
+        assert result.success is False
+
+    def test_configure_record_success_variant(self, cli: DcaCli):
+        """'Configure Record command : Success' → success=True."""
+        proc = _make_proc_result(0, "Configure Record command : Success\n")
+        with patch("subprocess.run", return_value=proc):
+            result = cli.configure_record()
+        assert result.success is True
+
+    def test_configure_record_existing_pattern_still_works(self, cli: DcaCli):
+        """Existing 'Record delay configured' variant still works."""
+        proc = _make_proc_result(0, "Record delay configured\n")
+        with patch("subprocess.run", return_value=proc):
+            result = cli.configure_record()
+        assert result.success is True
+
+    def test_configure_record_with_failure_keyword(self, cli: DcaCli):
+        """Failure keyword overrides configure_record success variant."""
+        proc = _make_proc_result(
+            0, "Configure Record command : Success\nError: register\n",
+        )
+        with patch("subprocess.run", return_value=proc):
+            result = cli.configure_record()
+        assert result.success is False
+
+    def test_all_three_success_variants_coexist(self, cli: DcaCli):
+        """All three live : Success patterns are independently recognized."""
+        cases = [
+            ("reset_fpga", "Reset FPGA command : Success"),
+            ("configure_fpga", "FPGA Configuration command : Success"),
+            ("configure_record", "Configure Record command : Success"),
+        ]
+        for method_name, stdout in cases:
+            proc = _make_proc_result(0, stdout + "\n")
+            with patch("subprocess.run", return_value=proc):
+                result = getattr(cli, method_name)()
+            assert result.success is True, f"{method_name} with '{stdout}' should be success"
+
+
+# ---------------------------------------------------------------------------
+# Path-Length Tests (TI CLI argv[2] 98-char limit)
+# ---------------------------------------------------------------------------
+
+class TestTiCliPathLength:
+    """Regression tests for TI's DCA1000EVM_CLI_Control.exe 98-char path limit."""
+
+    def test_constant_is_98(self):
+        """TI_CLI_MAX_ARG_PATH_LEN must be 98 (empirically verified)."""
+        from awr2944_dca.dca_cli import TI_CLI_MAX_ARG_PATH_LEN
+        assert TI_CLI_MAX_ARG_PATH_LEN == 98
+
+    def test_make_temp_cf_json_within_limit(self, tmp_path):
+        """make_temp_cf_json produces paths <= 98 chars."""
+        from awr2944_dca.dca_cli import TI_CLI_MAX_ARG_PATH_LEN
+
+        # Create a minimal source cf.json
+        src_cf = tmp_path / "cf.json"
+        src_cf.write_text(
+            '{"DCA1000Config":{"captureConfig":{"fileBasePath":"D:\\\\old"}}}',
+            encoding="utf-8",
+        )
+
+        result = DcaCli.make_temp_cf_json(src_cf, file_base_path="C:\\test")
+        try:
+            assert result.exists()
+            assert len(str(result)) <= TI_CLI_MAX_ARG_PATH_LEN
+            # Verify it's valid JSON
+            import json
+            with open(result) as f:
+                data = json.load(f)
+            assert "DCA1000Config" in data
+        finally:
+            result.unlink(missing_ok=True)
+
+    def test_make_temp_cf_json_unique_per_call(self, tmp_path):
+        """Each call produces a unique filename."""
+        src_cf = tmp_path / "cf.json"
+        src_cf.write_text(
+            '{"DCA1000Config":{"captureConfig":{"fileBasePath":"D:\\\\old"}}}',
+            encoding="utf-8",
+        )
+
+        paths = set()
+        for _ in range(10):
+            p = DcaCli.make_temp_cf_json(src_cf, file_base_path="C:\\test")
+            paths.add(str(p))
+            p.unlink(missing_ok=True)
+
+        assert len(paths) == 10, "10 calls should produce 10 unique paths"
+
+    def test_make_temp_cf_json_preserves_customization(self, tmp_path):
+        """The customized fileBasePath is correctly set in the output."""
+        import json
+
+        src_cf = tmp_path / "cf.json"
+        src_cf.write_text(
+            '{"DCA1000Config":{"captureConfig":{"fileBasePath":"D:\\\\old","filePrefix":"lua_check"}}}',
+            encoding="utf-8",
+        )
+
+        new_base = "C:\\Users\\test\\captures"
+        result = DcaCli.make_temp_cf_json(src_cf, file_base_path=new_base)
+        try:
+            with open(result) as f:
+                data = json.load(f)
+            # The JSON stores the escaped version; when parsed back, the
+            # backslashes are present as-is (double-escaped in JSON source).
+            fbp = data["DCA1000Config"]["captureConfig"]["fileBasePath"]
+            # The copy_and_customize_config method double-escapes, so after
+            # json.load, the value contains literal double-backslashes.
+            assert "test" in fbp
+            assert "captures" in fbp
+        finally:
+            result.unlink(missing_ok=True)
+
+    def test_make_temp_cf_json_rejects_excessive_path(self, tmp_path, monkeypatch):
+        """ValueError raised if generated path exceeds TI limit."""
+        from awr2944_dca.dca_cli import TI_CLI_MAX_ARG_PATH_LEN
+
+        src_cf = tmp_path / "cf.json"
+        src_cf.write_text(
+            '{"DCA1000Config":{"captureConfig":{"fileBasePath":"D:\\\\old"}}}',
+            encoding="utf-8",
+        )
+
+        # Monkeypatch tempfile.gettempdir to return a very long path
+        long_dir = "C:\\" + "x" * 100
+        monkeypatch.setattr("tempfile.gettempdir", lambda: long_dir)
+
+        with pytest.raises(ValueError, match="path too long"):
+            DcaCli.make_temp_cf_json(src_cf, file_base_path="C:\\test")
+
+    def test_copy_and_customize_never_modifies_source(self, tmp_path):
+        """copy_and_customize_config must not modify the source cf.json."""
+        import json
+
+        src_cf = tmp_path / "cf.json"
+        original = '{"DCA1000Config":{"captureConfig":{"fileBasePath":"D:\\\\old"}}}'
+        src_cf.write_text(original, encoding="utf-8")
+        original_bytes = src_cf.read_bytes()
+
+        dst_cf = tmp_path / "out" / "cf_copy.json"
+        DcaCli.copy_and_customize_config(
+            src_cf, dst_cf,
+            file_base_path="C:\\new_path",
+        )
+
+        assert src_cf.read_bytes() == original_bytes

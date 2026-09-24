@@ -1,0 +1,3 @@
+# Default smoke profile
+[profile]
+name = "smoke_v1"
