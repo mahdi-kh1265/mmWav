@@ -300,6 +300,17 @@ def _run_capture_facade(
         guard_frames=guard_frames,
     )
     
+    # Explicit live-execution gate.  Runs BEFORE connection resolution, lock
+    # acquisition, session state transitions, directory creation or any
+    # UART/DCA/UDP access.  Configs that resolve and plan offline (e.g.
+    # multi-chirp TDM) are rejected here, not by an incidental DSP failure.
+    if not resolved_config.capabilities.can_execute_live:
+        from awr2944_dca.api._config_resolver import LiveExecutionNotEnabledError
+        raise LiveExecutionNotEnabledError(
+            resolved_config.capabilities.live_block_reason
+            or "Live execution is not enabled for this configuration."
+        )
+    
     sdk_cli_commands = resolved_config.cli_commands
     effective = resolved_config.structured_profile # Might be None
     

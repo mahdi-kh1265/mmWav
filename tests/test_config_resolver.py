@@ -152,14 +152,19 @@ def test_multi_chirp_parse_succeeds(tmp_path):
     cfg = MmwDemoConfig.from_cfg_file(cfg_path)
     assert len(cfg.lines) == 2
 
-def test_multi_chirp_execution_rejected(tmp_path):
-    cfg_text = "channelCfg 15 7 0\nadcCfg 2 0\nadcbufCfg -1 1 1 1 1\nprofileCfg 0 77 429 7 57.14 0 0 70 1 256 5209 0 0 30\nchirpCfg 0 0 0 0 0 0 0 1\nchirpCfg 1 1 0 0 0 0 0 2\nframeCfg 0 0 128 8 100 1 0"
+def test_multi_chirp_execution_rejected(tmp_path, dummy_project):
+    # Superseded semantics: multi-TX configs now resolve/plan offline (no blanket
+    # preflight error) but live execution is blocked via capabilities.
+    cfg_text = "channelCfg 15 7 0\nadcCfg 2 0\nadcbufCfg -1 1 1 1 1\nprofileCfg 0 77 429 7 57.14 0 0 70 1 256 5209 0 0 30\nchirpCfg 0 0 0 0 0 0 0 1\nchirpCfg 1 1 0 0 0 0 0 2\nframeCfg 0 1 64 8 100 1 0"
     cfg_path = tmp_path / "temp.cfg"
     cfg_path.write_text(cfg_text)
     cfg = MmwDemoConfig.from_cfg_file(cfg_path)
     meta = extract_capture_metadata(cfg)
     issues = preflight_validate(cfg, meta)
-    assert any(i.severity == "ERROR" and "Multiple unique chirpCfg" in i.message for i in issues)
+    assert not any(i.severity == "ERROR" for i in issues)
+    res = resolve_capture_config(dummy_project, cfg_path, frames=8, guard_frames=1)
+    assert res.capabilities.can_plan
+    assert not res.capabilities.can_execute_live
 
 def test_advanced_frame_parse_succeeds(tmp_path):
     cfg_text = "advFrameCfg 1 2 3"
@@ -177,9 +182,13 @@ def test_advanced_frame_execution_rejected(tmp_path):
     issues = preflight_validate(cfg, meta)
     assert any(i.severity == "ERROR" and "Advanced frame" in i.message for i in issues)
 
-def test_multi_chirp_dsp_profile_is_none(tmp_path):
-    # Currently handled in resolver
-    pass
+def test_multi_chirp_dsp_profile_is_none(tmp_path, dummy_project):
+    cfg_text = "channelCfg 15 7 0\nadcCfg 2 0\nadcbufCfg -1 1 1 1 1\nprofileCfg 0 77 429 7 57.14 0 0 70 1 256 5209 0 0 30\nchirpCfg 0 0 0 0 0 0 0 1\nchirpCfg 1 1 0 0 0 0 0 2\nframeCfg 0 1 64 8 100 1 0"
+    cfg_path = tmp_path / "temp.cfg"
+    cfg_path.write_text(cfg_text)
+    res = resolve_capture_config(dummy_project, cfg_path, frames=8, guard_frames=1)
+    assert res.dsp_profile is None
+    assert not res.capabilities.can_build_legacy_dsp_profile
 
 # Provenance 21-26
 def test_source_toml_preserved(dummy_project):

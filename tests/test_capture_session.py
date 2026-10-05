@@ -54,7 +54,19 @@ def test_canonical_extraction(tmp_path):
     class MockUart:
 
         def __init__(self, *args, **kwargs):
-            pass
+            class DummySerial:
+                timeout = 0
+                def reset_input_buffer(self): pass
+                def write(self, d): pass
+                def read(self, n):
+                    import time
+                    time.sleep(2.1)
+                    return b""
+            self._serial = DummySerial()
+            self._record = lambda *a, **k: None
+
+        def read_until_prompt(self, timeout=None):
+            return "mmwDemo:/>"
 
         def __enter__(self):
             return self
@@ -140,7 +152,19 @@ def test_canonical_extraction_rejects_incomplete(tmp_path):
     class MockUart:
 
         def __init__(self, *args, **kwargs):
-            pass
+            class DummySerial:
+                timeout = 0
+                def reset_input_buffer(self): pass
+                def write(self, d): pass
+                def read(self, n):
+                    import time
+                    time.sleep(2.1)
+                    return b""
+            self._serial = DummySerial()
+            self._record = lambda *a, **k: None
+
+        def read_until_prompt(self, timeout=None):
+            return "mmwDemo:/>"
 
         def __enter__(self):
             return self
@@ -224,7 +248,19 @@ def test_long_uart_config_receiver_stays_alive(tmp_path):
     class MockUart:
 
         def __init__(self, *args, **kwargs):
-            pass
+            class DummySerial:
+                timeout = 0
+                def reset_input_buffer(self): pass
+                def write(self, d): pass
+                def read(self, n):
+                    import time
+                    time.sleep(2.1)
+                    return b""
+            self._serial = DummySerial()
+            self._record = lambda *a, **k: None
+
+        def read_until_prompt(self, timeout=None):
+            return "mmwDemo:/>"
 
         def __enter__(self):
             return self
@@ -319,7 +355,19 @@ def test_event_ordering(tmp_path):
     class MockUart:
 
         def __init__(self, *args, **kwargs):
-            pass
+            class DummySerial:
+                timeout = 0
+                def reset_input_buffer(self): pass
+                def write(self, d): pass
+                def read(self, n):
+                    import time
+                    time.sleep(2.1)
+                    return b""
+            self._serial = DummySerial()
+            self._record = lambda *a, **k: None
+
+        def read_until_prompt(self, timeout=None):
+            return "mmwDemo:/>"
 
         def __enter__(self):
             return self
@@ -413,7 +461,19 @@ def test_zero_byte_capture_is_failure(tmp_path):
     class MockUart:
 
         def __init__(self, *args, **kwargs):
-            pass
+            class DummySerial:
+                timeout = 0
+                def reset_input_buffer(self): pass
+                def write(self, d): pass
+                def read(self, n):
+                    import time
+                    time.sleep(2.1)
+                    return b""
+            self._serial = DummySerial()
+            self._record = lambda *a, **k: None
+
+        def read_until_prompt(self, timeout=None):
+            return "mmwDemo:/>"
 
         def __enter__(self):
             return self
@@ -495,7 +555,19 @@ def test_stream_integrity_failure(tmp_path):
     class MockUart:
 
         def __init__(self, *args, **kwargs):
-            pass
+            class DummySerial:
+                timeout = 0
+                def reset_input_buffer(self): pass
+                def write(self, d): pass
+                def read(self, n):
+                    import time
+                    time.sleep(2.1)
+                    return b""
+            self._serial = DummySerial()
+            self._record = lambda *a, **k: None
+
+        def read_until_prompt(self, timeout=None):
+            return "mmwDemo:/>"
 
         def __enter__(self):
             return self

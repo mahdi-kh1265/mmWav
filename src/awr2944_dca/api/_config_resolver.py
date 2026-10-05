@@ -4,8 +4,39 @@ from pathlib import Path
 from typing import Any, Optional
 
 from awr2944_dca.api.profile import RadarProfile as StructuredRadarProfile
+from awr2944_dca.chirp_schedule import (
+    BasicFrameSchedule,
+    ChirpScheduleError,
+    resolve_schedule_from_cli,
+    schedule_byte_plan,
+)
 from awr2944_dca.dsp.config import RadarProfile as DspRadarProfile
 from awr2944_dca.mmw_demo_config import MmwDemoConfig, KNOWN_COMMANDS
+
+
+class LiveExecutionNotEnabledError(ValueError):
+    """Raised before any hardware access when a resolved config cannot run live.
+
+    The configuration may still resolve and plan offline successfully.
+    """
+
+
+@dataclass(frozen=True)
+class CaptureCapabilities:
+    """Independent capability flags for a resolved capture configuration.
+
+    Defaults are all False (fail closed).  A configuration can, for example,
+    resolve and plan offline while live execution and DSP remain unsupported.
+    """
+    can_resolve: bool = False
+    can_compute_byte_plan: bool = False
+    can_plan: bool = False
+    can_execute_live: bool = False
+    can_build_legacy_dsp_profile: bool = False
+    can_run_tdm_dsp: bool = False
+    can_run_aoa: bool = False
+    live_block_reason: Optional[str] = None
+    legacy_dsp_block_reason: Optional[str] = None
 
 @dataclass(frozen=True)
 class BytePlan:
@@ -88,6 +119,10 @@ class ResolvedCaptureConfig:
     derived: Optional[dict[str, float]]
     
     preflight_warnings: list[str] = field(default_factory=list)
+    
+    # Authoritative basic-frame schedule (chirp cycle, loops, TX masks).
+    schedule: Optional[BasicFrameSchedule] = None
+    capabilities: CaptureCapabilities = field(default_factory=CaptureCapabilities)
 
 
 def extract_capture_metadata(cfg: MmwDemoConfig) -> CfgCaptureMetadata:
@@ -203,10 +238,14 @@ def preflight_validate(cfg: MmwDemoConfig, meta: CfgCaptureMetadata) -> list[Val
     if len(prof_cmds) > 1:
         issues.append(ValidationIssue("ERROR", "Multiple profileCfg commands. Current parser cannot represent."))
         
-    chirp_cmds = [line for line in cfg.lines if line.command == "chirpCfg"]
-    tx_patterns = {line.args[7] for line in chirp_cmds if len(line.args) >= 8}
-    if len(tx_patterns) > 1:
-        issues.append(ValidationIssue("ERROR", "Multiple unique chirpCfg TX patterns. Multi-chirp TDM unsupported for execution."))
+    # Multi-chirp / multi-TX configs are resolvable and plannable offline; live
+    # execution is gated separately via CaptureCapabilities.  The schedule must
+    # still be unambiguous: undefined/overlapping chirps or bad ranges are errors.
+    if {"chirpCfg", "frameCfg"} <= found_cmds:
+        try:
+            resolve_schedule_from_cli(build_cli_commands(cfg))
+        except ChirpScheduleError as exc:
+            issues.append(ValidationIssue("ERROR", f"Invalid chirp schedule: {exc}"))
         
     adv_frame = any(line.command in {"advFrameCfg", "subFrameCfg"} for line in cfg.lines)
     if adv_frame:
@@ -262,6 +301,102 @@ def build_dsp_profile(meta: CfgCaptureMetadata) -> Optional[DspRadarProfile]:
 def attempt_structured_conversion(cfg: MmwDemoConfig, meta: CfgCaptureMetadata) -> Optional[StructuredRadarProfile]:
     return None
 
+
+def _check_chirp_count_consistency(
+    schedule: BasicFrameSchedule,
+    compat_chirps_per_frame: int,
+    resolved_frames: int,
+    origin: str,
+) -> None:
+    """Fail explicitly if a legacy chirp/frame count disagrees with the schedule."""
+    if compat_chirps_per_frame != schedule.physical_chirps_per_frame:
+        raise ValueError(
+            f"Chirp count mismatch ({origin}): configured chirps_per_frame={compat_chirps_per_frame} "
+            f"but resolved schedule has {schedule.physical_chirps_per_frame} physical chirps/frame "
+            f"({schedule.chirps_per_cycle} chirps/cycle x {schedule.loops_per_frame} loops)."
+        )
+    if schedule.frame_count != resolved_frames:
+        raise ValueError(
+            f"Frame count mismatch ({origin}): expected {resolved_frames} native frames "
+            f"but resolved schedule has {schedule.frame_count}."
+        )
+
+
+def _build_capabilities(
+    schedule: BasicFrameSchedule,
+    dsp_profile: Optional[DspRadarProfile],
+) -> CaptureCapabilities:
+    """Derive capabilities.  Live execution requires the legacy single-chirp path."""
+    if dsp_profile is None:
+        dsp_reason = (
+            "The flat legacy DSP profile could not be built for this configuration "
+            f"({schedule.chirps_per_cycle} chirps/cycle, TX masks {schedule.tx_masks_per_cycle})."
+        )
+    else:
+        dsp_reason = None
+
+    if not schedule.is_single_chirp:
+        live_reason = (
+            "Configuration resolves and plans successfully, but live multi-chirp execution "
+            f"is not yet enabled ({schedule.chirps_per_cycle} chirps/cycle, "
+            f"TX masks per cycle {schedule.tx_masks_per_cycle})."
+        )
+    elif dsp_profile is None:
+        live_reason = (
+            "Configuration resolves and plans successfully, but live execution is not enabled: "
+            + dsp_reason
+        )
+    else:
+        live_reason = None
+
+    return CaptureCapabilities(
+        can_resolve=True,
+        can_compute_byte_plan=True,
+        can_plan=True,
+        can_execute_live=live_reason is None,
+        can_build_legacy_dsp_profile=dsp_profile is not None,
+        can_run_tdm_dsp=False,
+        can_run_aoa=False,
+        live_block_reason=live_reason,
+        legacy_dsp_block_reason=dsp_reason,
+    )
+
+
+def _make_byte_plan(
+    schedule: BasicFrameSchedule,
+    rx_channels: int,
+    samples_per_chirp: int,
+    canonical_frames: int,
+    guard_frames: int,
+) -> BytePlan:
+    """Real-int16 byte plan from the schedule (trusted awr2944_adc arithmetic)."""
+    sbp = schedule_byte_plan(
+        schedule,
+        rx_channels=rx_channels,
+        samples_per_chirp=samples_per_chirp,
+        canonical_frames=canonical_frames,
+        guard_frames=guard_frames,
+    )
+    return BytePlan(
+        adc_format="real_int16",
+        bytes_per_scalar_component=2,
+        components_per_sample=1,
+        bytes_per_adc_sample=2,
+        samples_per_chirp=samples_per_chirp,
+        rx_channels=rx_channels,
+        chirps_per_frame=schedule.physical_chirps_per_frame,
+        total_frames=sbp.total_frames,
+        canonical_frames=canonical_frames,
+        guard_frames=guard_frames,
+        dca_word_slots=4,
+        active_lanes=2,
+        dca_expansion_factor=2,
+        native_active_payload_bytes=sbp.native_active_payload_bytes,
+        native_dca_bytes=sbp.native_dca_bytes,
+        canonical_active_payload_bytes=sbp.canonical_active_payload_bytes,
+        canonical_dca_bytes=sbp.canonical_dca_bytes,
+    )
+
 def resolve_capture_config(
     project: Any,
     profile: Any,
@@ -309,24 +444,17 @@ def resolve_capture_config(
         # Calculate rx_channels based on rx_mask
         rx_channels = effective_profile.channel.rx_mask.bit_count()
         
-        byte_plan = BytePlan(
-            adc_format="real_int16",
-            bytes_per_scalar_component=2,
-            components_per_sample=1,
-            bytes_per_adc_sample=2,
-            samples_per_chirp=profile.sampling.samples,
-            rx_channels=rx_channels,
-            chirps_per_frame=profile.frame.chirps_per_frame,
-            total_frames=resolved_frames,
-            canonical_frames=canonical_frames,
-            guard_frames=guard_frames,
-            dca_word_slots=4,
-            active_lanes=2,
-            dca_expansion_factor=2,
-            native_active_payload_bytes=resolved_frames * profile.frame.chirps_per_frame * rx_channels * profile.sampling.samples * 2,
-            native_dca_bytes=resolved_frames * profile.frame.chirps_per_frame * rx_channels * profile.sampling.samples * 2 * 2,
-            canonical_active_payload_bytes=canonical_frames * profile.frame.chirps_per_frame * rx_channels * profile.sampling.samples * 2,
-            canonical_dca_bytes=canonical_frames * profile.frame.chirps_per_frame * rx_channels * profile.sampling.samples * 2 * 2,
+        # Authoritative schedule comes from the exact commands that will be sent.
+        try:
+            schedule = resolve_schedule_from_cli(cli_commands)
+        except ChirpScheduleError as exc:
+            raise ValueError(f"Invalid chirp schedule: {exc}") from exc
+        _check_chirp_count_consistency(
+            schedule, profile.frame.chirps_per_frame, resolved_frames, "structured profile"
+        )
+        
+        byte_plan = _make_byte_plan(
+            schedule, rx_channels, profile.sampling.samples, canonical_frames, guard_frames
         )
         
         resolved_cfg_text = "\n".join(cli_commands) + "\n"
@@ -344,6 +472,8 @@ def resolve_capture_config(
             resolved_sha256=hashlib.sha256(resolved_cfg_text.encode("utf-8")).hexdigest(),
             derived={},
             preflight_warnings=[],
+            schedule=schedule,
+            capabilities=_build_capabilities(schedule, dsp_profile),
         )
         
     elif isinstance(profile, (Path, MmwDemoConfig)):
@@ -394,26 +524,18 @@ def resolve_capture_config(
         cli_commands = build_cli_commands(cfg, num_frames_override=None)
         dsp_profile = build_dsp_profile(meta)
         
-        logical_per_frame = meta.total_chirps_per_frame * meta.rx_count * meta.adc_samples * meta.bytes_per_adc_sample
+        try:
+            schedule = resolve_schedule_from_cli(cli_commands)
+        except ChirpScheduleError as exc:
+            raise ValueError(f"Invalid chirp schedule: {exc}") from exc
+        _check_chirp_count_consistency(
+            schedule, meta.total_chirps_per_frame, resolved_frames, "cfg metadata"
+        )
         
-        byte_plan = BytePlan(
-            adc_format="real_int16" if not meta.is_complex else "complex_int16",
-            bytes_per_scalar_component=2,
-            components_per_sample=1 if not meta.is_complex else 2,
-            bytes_per_adc_sample=meta.bytes_per_adc_sample,
-            samples_per_chirp=meta.adc_samples,
-            rx_channels=meta.rx_count,
-            chirps_per_frame=meta.total_chirps_per_frame,
-            total_frames=resolved_frames,
-            canonical_frames=canonical_frames,
-            guard_frames=guard_frames,
-            dca_word_slots=4,
-            active_lanes=2,
-            dca_expansion_factor=2,
-            native_active_payload_bytes=resolved_frames * logical_per_frame,
-            native_dca_bytes=resolved_frames * logical_per_frame * 2,
-            canonical_active_payload_bytes=canonical_frames * logical_per_frame,
-            canonical_dca_bytes=canonical_frames * logical_per_frame * 2,
+        # preflight_validate has already rejected complex ADC formats, so the
+        # real-int16 schedule byte plan applies.
+        byte_plan = _make_byte_plan(
+            schedule, meta.rx_count, meta.adc_samples, canonical_frames, guard_frames
         )
         
         resolved_cfg_text = "\n".join(cli_commands) + "\n"
@@ -431,6 +553,8 @@ def resolve_capture_config(
             resolved_sha256=hashlib.sha256(resolved_cfg_text.encode("utf-8")).hexdigest(),
             derived=None,
             preflight_warnings=warnings,
+            schedule=schedule,
+            capabilities=_build_capabilities(schedule, dsp_profile),
         )
         
     else:

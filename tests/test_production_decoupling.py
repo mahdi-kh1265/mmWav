@@ -9,10 +9,7 @@ def test_production_modules_do_not_import_mmws():
     """Verify that production capture modules do not import legacy mmws modules."""
     import sys
 
-    # Clean up sys.modules to start fresh
-    to_remove = [k for k in sys.modules if k.startswith("awr2944_dca")]
-    for k in to_remove:
-        del sys.modules[k]
+    # Clean up sys.modules to start fresh - removed to prevent poisoning
 
     # Import production modules
     import awr2944_dca.capture_cli
