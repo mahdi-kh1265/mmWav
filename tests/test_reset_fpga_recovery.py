@@ -207,6 +207,13 @@ def _run(tmp_path, dca_cli_mock):
     cs.DirectUdpCapture = MockDca
     cs.AwrUartConnection = MockUart
     cs.UdpReceiverThread = MockReceiver
+    
+    # Mock for dca_arm stage
+    fake_cf = tmp_path / "fake.json"
+    fake_cf.write_text("{}", encoding="utf-8")
+    dca_cli_mock._cf_json = fake_cf
+    dca_cli_mock.arm_record.return_value = _ok_result("arm_record")
+    
     try:
         with patch.object(cs.time, "sleep"):
             prof = RadarProfile.from_smoke_v1()

@@ -4,8 +4,40 @@ from pathlib import Path
 from typing import Any, Optional
 
 from awr2944_dca.api.profile import RadarProfile as StructuredRadarProfile
+from awr2944_dca.chirp_schedule import (
+    BasicFrameSchedule,
+    ChirpScheduleError,
+    resolve_schedule_from_cli,
+    schedule_byte_plan,
+)
+from awr2944_dca.capture_layout import CaptureDataLayout, build_capture_layout
 from awr2944_dca.dsp.config import RadarProfile as DspRadarProfile
 from awr2944_dca.mmw_demo_config import MmwDemoConfig, KNOWN_COMMANDS
+
+
+class LiveExecutionNotEnabledError(ValueError):
+    """Raised before any hardware access when a resolved config cannot run live.
+
+    The configuration may still resolve and plan offline successfully.
+    """
+
+
+@dataclass(frozen=True)
+class CaptureCapabilities:
+    """Independent capability flags for a resolved capture configuration.
+
+    Defaults are all False (fail closed).  A configuration can, for example,
+    resolve and plan offline while live execution and DSP remain unsupported.
+    """
+    can_resolve: bool = False
+    can_compute_byte_plan: bool = False
+    can_plan: bool = False
+    can_execute_live: bool = False
+    can_build_legacy_dsp_profile: bool = False
+    can_run_tdm_dsp: bool = False
+    can_run_aoa: bool = False
+    live_block_reason: Optional[str] = None
+    legacy_dsp_block_reason: Optional[str] = None
 
 @dataclass(frozen=True)
 class BytePlan:
@@ -67,6 +99,75 @@ class ValidationIssue:
     message: str
 
 
+# TI AWR294x CLI handlers check argc (including the command name):
+#   profileCfg argc==15, frameCfg argc==9, channelCfg argc==4, adcCfg argc==3,
+#   adcbufCfg 5 args (+optional subframe), lvdsStreamCfg 4 args (+optional subframe).
+_EXACT_ARG_COUNTS = {
+    "profileCfg": 14,
+    "frameCfg": 8,
+    "channelCfg": 3,
+    "adcCfg": 2,
+    "adcbufCfg": 5,
+    "lvdsStreamCfg": 4,
+}
+
+# RX layout policy for live raw capture.
+# Proven from SDK source (cbuff_transfer.c CBUFF_setupNonInterleaved_ADC): active RX channels
+# are streamed in ascending physical index order, one adcTransferSize block per RX, so
+# native bytes scale linearly with the number of active RX.  Only 4 RX (0b1111) has been
+# verified on hardware in this repository.
+HARDWARE_VERIFIED_RX_MASKS = frozenset({0b1111})
+# Two-RX masks follow the same SDK-proven layout but are NOT hardware verified (allowed with
+# an explicit warning).  1 RX (Studio requires a single lane, demo is fixed at 2 lanes) and
+# 3 RX (not a documented AWR2944 LVDS mode) fail closed.
+UNVERIFIED_RX_MASKS = frozenset({0b0011, 0b0101, 0b0110, 0b1001, 0b1010, 0b1100})
+
+
+def active_rx_channels(rx_mask: int) -> tuple[int, ...]:
+    """Physical RX indices in the order the raw stream carries them (ascending)."""
+    return tuple(i for i in range(4) if (rx_mask >> i) & 1)
+
+
+def _stream_cfg_block(cfg: Optional[MmwDemoConfig]) -> Optional[str]:
+    """Config-level gates that change the raw LVDS byte layout (SDK mmw_cli.c /
+    mmw_lvds_stream.c).  Returns a reason or None."""
+    if cfg is None:
+        return None
+    lines = [l for l in cfg.lines if l.is_command]
+    lvds = [l for l in lines if l.command == "lvdsStreamCfg"]
+    if len(lvds) != 1:
+        return (
+            "exactly one 'lvdsStreamCfg' is required for raw capture (found "
+            f"{len(lvds)}); add 'lvdsStreamCfg -1 0 1 0' (no HSI header, ADC data, no SW session)."
+        )
+    a = list(lvds[0].args)
+    if len(a) != 4 or a[0] not in ("-1", "0") or a[1:] != ["0", "1", "0"]:
+        return (
+            f"lvdsStreamCfg {' '.join(a)} changes the stream layout: raw capture requires "
+            "isHeaderEnabled=0, dataFmt=1 (ADC), isSwEnabled=0 ('lvdsStreamCfg -1 0 1 0')."
+        )
+    adcbuf = [l for l in lines if l.command == "adcbufCfg"]
+    if len(adcbuf) != 1:
+        return f"exactly one 'adcbufCfg' is required (found {len(adcbuf)})."
+    b = list(adcbuf[0].args)
+    if len(b) != 5 or b[0] not in ("-1", "0"):
+        return "adcbufCfg must be a single global/sub-frame-0 command with 5 arguments."
+    if b[3] != "1":
+        return (
+            f"adcbufCfg chInterleave={b[3]}: only non-interleaved (1) has a known RX layout "
+            "(CBUFF non-interleaved: one contiguous block per RX)."
+        )
+    if b[4] != "1":
+        return "adcbufCfg chirpThreshold must be 1 (demo firmware rejects other values)."
+    frame = [l for l in lines if l.command == "frameCfg"]
+    if len(frame) == 1 and len(frame[0].args) == 8 and frame[0].args[6] != "1":
+        return (
+            f"frameCfg triggerSelect={frame[0].args[6]}: only software trigger (1) is supported; "
+            "hardware trigger would wait for an external pulse."
+        )
+    return None
+
+
 @dataclass(frozen=True)
 class ResolvedCaptureConfig:
     """Immutable resolved configuration ready for capture execution."""
@@ -88,6 +189,12 @@ class ResolvedCaptureConfig:
     derived: Optional[dict[str, float]]
     
     preflight_warnings: list[str] = field(default_factory=list)
+    
+    # Authoritative basic-frame schedule (chirp cycle, loops, TX masks).
+    schedule: Optional[BasicFrameSchedule] = None
+    capabilities: CaptureCapabilities = field(default_factory=CaptureCapabilities)
+    # DSP-independent raw acquisition layout: [frame, physical_chirp, rx, sample].
+    capture_layout: Optional[CaptureDataLayout] = None
 
 
 def extract_capture_metadata(cfg: MmwDemoConfig) -> CfgCaptureMetadata:
@@ -117,7 +224,10 @@ def extract_capture_metadata(cfg: MmwDemoConfig) -> CfgCaptureMetadata:
     chirps_per_loop = (chirp_end - chirp_start + 1) if frame_cmd else 0
     num_loops = int(frame_cmd.args[2]) if frame_cmd and len(frame_cmd.args) >= 7 else 0
     num_frames = int(frame_cmd.args[3]) if frame_cmd and len(frame_cmd.args) >= 7 else 0
-    frame_period = float(frame_cmd.args[4]) if frame_cmd and len(frame_cmd.args) >= 7 else 0.0
+    # 7-arg: ... numFrames framePeriod trigger delay
+    # 8-arg (AWR294x): ... numFrames numAdcSamples framePeriod trigger delay
+    period_idx = 5 if (frame_cmd and len(frame_cmd.args) >= 8) else 4
+    frame_period = float(frame_cmd.args[period_idx]) if frame_cmd and len(frame_cmd.args) >= 7 else 0.0
     
     adc_bits = int(adc_cmd.args[0]) if adc_cmd and len(adc_cmd.args) >= 2 else 2
     adc_fmt = int(adc_cmd.args[1]) if adc_cmd and len(adc_cmd.args) >= 2 else 0
@@ -198,15 +308,45 @@ def preflight_validate(cfg: MmwDemoConfig, meta: CfgCaptureMetadata) -> list[Val
     unknown = [line.command for line in cfg.lines if line.is_command and line.command not in KNOWN_COMMANDS]
     if unknown:
         issues.append(ValidationIssue("ERROR", f"Unknown commands cannot be transmitted: {unknown}"))
+
+    # Firmware-accurate argument counts (TI cli_mmwave.c: argc includes the command
+    # name).  Commands the firmware would reject must never reach the radar.
+    for cmd, want in _EXACT_ARG_COUNTS.items():
+        for line in cfg.lines:
+            if line.is_command and line.command == cmd and len(line.args) != want:
+                issues.append(ValidationIssue(
+                    "ERROR",
+                    f"{cmd} requires exactly {want} arguments on AWR294x, got {len(line.args)}.",
+                ))
+
+    dfe_cmds = [line for line in cfg.lines if line.is_command and line.command == "dfeDataOutputMode"]
+    if len(dfe_cmds) != 1 or list(dfe_cmds[0].args[:1]) != ["1"]:
+        issues.append(ValidationIssue(
+            "ERROR",
+            "dfeDataOutputMode must be present exactly once and equal 1 (legacy frame mode).",
+        ))
+
+    if meta.num_loops < 1 or meta.num_loops > 255:
+        issues.append(ValidationIssue(
+            "ERROR", f"frameCfg numLoops {meta.num_loops} outside firmware range 1..255."
+        ))
+    if meta.num_frames > 65535:
+        issues.append(ValidationIssue(
+            "ERROR", f"frameCfg numFrames {meta.num_frames} exceeds firmware maximum 65535."
+        ))
         
     prof_cmds = [line for line in cfg.lines if line.command == "profileCfg"]
     if len(prof_cmds) > 1:
         issues.append(ValidationIssue("ERROR", "Multiple profileCfg commands. Current parser cannot represent."))
         
-    chirp_cmds = [line for line in cfg.lines if line.command == "chirpCfg"]
-    tx_patterns = {line.args[7] for line in chirp_cmds if len(line.args) >= 8}
-    if len(tx_patterns) > 1:
-        issues.append(ValidationIssue("ERROR", "Multiple unique chirpCfg TX patterns. Multi-chirp TDM unsupported for execution."))
+    # Multi-chirp / multi-TX configs are resolvable and plannable offline; live
+    # execution is gated separately via CaptureCapabilities.  The schedule must
+    # still be unambiguous: undefined/overlapping chirps or bad ranges are errors.
+    if {"chirpCfg", "frameCfg"} <= found_cmds:
+        try:
+            resolve_schedule_from_cli(build_cli_commands(cfg))
+        except ChirpScheduleError as exc:
+            issues.append(ValidationIssue("ERROR", f"Invalid chirp schedule: {exc}"))
         
     adv_frame = any(line.command in {"advFrameCfg", "subFrameCfg"} for line in cfg.lines)
     if adv_frame:
@@ -238,29 +378,240 @@ def build_cli_commands(cfg: MmwDemoConfig, num_frames_override: Optional[int] = 
     return tuple(commands)
 
 
-def build_dsp_profile(meta: CfgCaptureMetadata) -> Optional[DspRadarProfile]:
-    if meta.chirps_per_loop > 1:
-        # Multi-chirp TDM cannot be represented by DspRadarProfile correctly yet
-        return None
-        
-    try:
-        return DspRadarProfile(
-            start_frequency_hz=meta.start_freq_ghz * 1e9,
-            slope_hz_per_s=meta.slope_mhz_per_us * 1e12,
-            adc_sample_rate_hz=meta.sample_rate_ksps * 1e3,
-            adc_samples=meta.adc_samples,
-            idle_time_s=meta.idle_time_us * 1e-6,
-            ramp_end_time_s=meta.ramp_end_time_us * 1e-6,
-            chirps_per_frame=meta.total_chirps_per_frame,
-            rx_count=meta.rx_count,
-            tx_count=meta.tx_count,
+def legacy_dsp_block_reason(
+    meta: CfgCaptureMetadata,
+    schedule: Optional[BasicFrameSchedule],
+    profile_id: int = 0,
+) -> Optional[str]:
+    """Return why the flat legacy DspRadarProfile cannot faithfully represent this
+    configuration, or None if it can (single chirp definition, uniform TX)."""
+    if schedule is None:
+        return "No resolved chirp schedule."
+    if not schedule.is_single_chirp or meta.chirps_per_loop != 1:
+        return (
+            f"Multi-chirp schedule ({schedule.chirps_per_cycle} chirps/cycle, "
+            f"TX masks {schedule.tx_masks_per_cycle}) cannot be represented by the flat DSP profile."
         )
-    except Exception:
+    if not schedule.is_uniform_tx:
+        return "Non-uniform TX pattern cannot be represented by the flat DSP profile."
+    chirp = schedule.chirps[0]
+    if chirp.profile_id != profile_id:
+        return (
+            f"chirpCfg references profileId {chirp.profile_id} but the only profileCfg is id {profile_id}."
+        )
+    if (
+        chirp.start_freq_var_hz != 0.0
+        or chirp.freq_slope_var_mhz_per_us != 0.0
+        or chirp.idle_time_var_us != 0.0
+        or chirp.adc_start_time_var_us != 0.0
+    ):
+        return (
+            "chirpCfg applies per-chirp frequency/slope/idle/ADC-start variations that the flat "
+            "DSP profile does not represent."
+        )
+    if chirp.tx_enable_mask & ~meta.tx_mask:
+        return (
+            f"chirpCfg txEnable {chirp.tx_enable_mask} is not a subset of channelCfg "
+            f"txChannelEn {meta.tx_mask}."
+        )
+    if meta.rx_count < 1 or meta.adc_samples < 1:
+        return "Invalid RX count / sample count."
+    if meta.sample_rate_ksps <= 0 or meta.slope_mhz_per_us <= 0 or meta.start_freq_ghz <= 0:
+        return "Non-positive sample rate / slope / start frequency."
+    if meta.frame_period_ms <= 0:
+        return "Non-positive frame period."
+    return None
+
+
+def build_dsp_profile(
+    meta: CfgCaptureMetadata,
+    schedule: Optional[BasicFrameSchedule] = None,
+    profile_id: int = 0,
+) -> Optional[DspRadarProfile]:
+    """Map a resolved single-chirp basic-frame config onto the flat DSP profile.
+
+    Returns None (never a fabricated profile) if the config cannot be represented
+    faithfully.  ``frame_count`` is the native total (guard frames included), as in
+    the structured-profile path.
+    """
+    if schedule is None:
         return None
+    if legacy_dsp_block_reason(meta, schedule, profile_id) is not None:
+        return None
+    return DspRadarProfile(
+        start_frequency_hz=meta.start_freq_ghz * 1e9,
+        slope_hz_per_s=meta.slope_mhz_per_us * 1e12,
+        adc_sample_rate_hz=meta.sample_rate_ksps * 1e3,
+        adc_samples=meta.adc_samples,
+        idle_time_s=meta.idle_time_us * 1e-6,
+        ramp_end_time_s=meta.ramp_end_time_us * 1e-6,
+        chirps_per_frame=schedule.physical_chirps_per_frame,
+        frame_count=meta.num_frames,
+        frame_period_s=meta.frame_period_ms * 1e-3,
+        rx_count=meta.rx_count,
+        tx_mask=schedule.tx_masks_per_cycle[0],
+        sample_format="real_int16",
+        cube_layout="frame_chirp_rx_sample",
+    )
 
 
 def attempt_structured_conversion(cfg: MmwDemoConfig, meta: CfgCaptureMetadata) -> Optional[StructuredRadarProfile]:
     return None
+
+
+def raw_capture_block_reason(
+    meta: CfgCaptureMetadata,
+    schedule: Optional[BasicFrameSchedule],
+    profile_id: int = 0,
+    cfg: Optional[MmwDemoConfig] = None,
+) -> Optional[str]:
+    """Why raw ADC capture cannot be executed live for this basic-frame config.
+
+    Returns None when the raw byte layout is fully deterministic: physical chirp
+    count, RX count and samples/chirp are known, every chirp uses the single
+    profileCfg (so samples/chirp is constant) and the ADC format is the supported
+    real int16 one (enforced by preflight).  Per-chirp TX masks and per-chirp RF
+    variations do NOT block raw capture; they only block the legacy flat DSP profile.
+    """
+    block = "Configuration resolves and plans successfully, but live raw capture is not enabled: "
+    if schedule is None:
+        return block + "no resolved chirp schedule."
+    for chirp in schedule.chirps:
+        if chirp.profile_id != profile_id:
+            return block + (
+                f"chirp {chirp.chirp_index} references profileId {chirp.profile_id} but the only "
+                f"profileCfg is id {profile_id}; samples/chirp cannot be proven."
+            )
+        if chirp.tx_enable_mask & ~meta.tx_mask:
+            return block + (
+                f"chirp {chirp.chirp_index} txEnable {chirp.tx_enable_mask} is not a subset of "
+                f"channelCfg txChannelEn {meta.tx_mask}."
+            )
+    if meta.rx_count < 1 or meta.adc_samples < 1:
+        return block + "invalid RX count / sample count."
+    if meta.rx_mask < 1 or meta.rx_mask > 0xF:
+        return block + f"channelCfg rxChannelEn {meta.rx_mask} outside 0x1..0xF."
+    if meta.rx_mask not in HARDWARE_VERIFIED_RX_MASKS and meta.rx_mask not in UNVERIFIED_RX_MASKS:
+        return block + (
+            f"RX mask 0b{meta.rx_mask:04b} ({meta.rx_count} RX) is not a supported raw-stream mode: "
+            "1-RX (needs a single LVDS lane; demo is fixed at 2 lanes) and 3-RX (not a documented "
+            "AWR2944 LVDS mode) fail closed.  Use 4 RX (0b1111) or 2 RX."
+        )
+    if meta.adc_samples % 2 != 0:
+        return block + (
+            f"odd numAdcSamples ({meta.adc_samples}): samples are striped over 2 LVDS lanes, "
+            "layout unproven."
+        )
+    if meta.bytes_per_adc_sample != 2 or meta.is_complex:
+        return block + "only real int16 ADC data has a known byte layout."
+    if schedule.physical_chirps_per_frame < 1:
+        return block + "physical chirp count is not positive."
+    if cfg is not None:
+        stream = _stream_cfg_block(cfg)
+        if stream:
+            return block + stream
+    return None
+
+
+def _check_chirp_count_consistency(
+    schedule: BasicFrameSchedule,
+    compat_chirps_per_frame: int,
+    resolved_frames: int,
+    origin: str,
+) -> None:
+    """Fail explicitly if a legacy chirp/frame count disagrees with the schedule."""
+    if compat_chirps_per_frame != schedule.physical_chirps_per_frame:
+        raise ValueError(
+            f"Chirp count mismatch ({origin}): configured chirps_per_frame={compat_chirps_per_frame} "
+            f"but resolved schedule has {schedule.physical_chirps_per_frame} physical chirps/frame "
+            f"({schedule.chirps_per_cycle} chirps/cycle x {schedule.loops_per_frame} loops)."
+        )
+    if schedule.frame_count != resolved_frames:
+        raise ValueError(
+            f"Frame count mismatch ({origin}): expected {resolved_frames} native frames "
+            f"but resolved schedule has {schedule.frame_count}."
+        )
+
+
+def _build_capabilities(
+    schedule: BasicFrameSchedule,
+    dsp_profile: Optional[DspRadarProfile],
+    dsp_block_reason: Optional[str] = None,
+    raw_block_reason: Optional[str] = None,
+) -> CaptureCapabilities:
+    """Derive capabilities.  Live execution requires the legacy single-chirp path."""
+    if dsp_profile is None:
+        dsp_reason = (
+            "The flat legacy DSP profile could not be built for this configuration "
+            f"({schedule.chirps_per_cycle} chirps/cycle, TX masks {schedule.tx_masks_per_cycle})"
+            + (f": {dsp_block_reason}" if dsp_block_reason else ".")
+        )
+    else:
+        dsp_reason = None
+
+    # Raw capture eligibility is INDEPENDENT of DSP support.
+    live_reason = raw_block_reason
+
+    return CaptureCapabilities(
+        can_resolve=True,
+        can_compute_byte_plan=True,
+        can_plan=True,
+        can_execute_live=live_reason is None,
+        can_build_legacy_dsp_profile=dsp_profile is not None,
+        can_run_tdm_dsp=False,
+        can_run_aoa=False,
+        live_block_reason=live_reason,
+        legacy_dsp_block_reason=dsp_reason,
+    )
+
+
+def _make_byte_plan(
+    schedule: BasicFrameSchedule,
+    rx_channels: int,
+    samples_per_chirp: int,
+    canonical_frames: int,
+    guard_frames: int,
+) -> BytePlan:
+    """Real-int16 byte plan from the schedule (trusted awr2944_adc arithmetic)."""
+    sbp = schedule_byte_plan(
+        schedule,
+        rx_channels=rx_channels,
+        samples_per_chirp=samples_per_chirp,
+        canonical_frames=canonical_frames,
+        guard_frames=guard_frames,
+    )
+    return BytePlan(
+        adc_format="real_int16",
+        bytes_per_scalar_component=2,
+        components_per_sample=1,
+        bytes_per_adc_sample=2,
+        samples_per_chirp=samples_per_chirp,
+        rx_channels=rx_channels,
+        chirps_per_frame=schedule.physical_chirps_per_frame,
+        total_frames=sbp.total_frames,
+        canonical_frames=canonical_frames,
+        guard_frames=guard_frames,
+        dca_word_slots=4,
+        active_lanes=2,
+        dca_expansion_factor=2,
+        native_active_payload_bytes=sbp.native_active_payload_bytes,
+        native_dca_bytes=sbp.native_dca_bytes,
+        canonical_active_payload_bytes=sbp.canonical_active_payload_bytes,
+        canonical_dca_bytes=sbp.canonical_dca_bytes,
+    )
+
+def _structured_raw_block(effective_profile: Any) -> Optional[str]:
+    """RX-mask gate for the structured (TOML/RadarProfile) path; the SDK CLI it emits is fixed."""
+    mask = effective_profile.channel.rx_mask
+    if mask not in HARDWARE_VERIFIED_RX_MASKS and mask not in UNVERIFIED_RX_MASKS:
+        return (
+            f"Raw capture is not enabled: RX mask 0b{mask:04b} is not a supported raw-stream mode "
+            "(use 4 RX or 2 RX)."
+        )
+    if effective_profile.sampling.samples % 2 != 0:
+        return "Raw capture is not enabled: odd numAdcSamples layout is unproven."
+    return None
+
 
 def resolve_capture_config(
     project: Any,
@@ -309,24 +660,17 @@ def resolve_capture_config(
         # Calculate rx_channels based on rx_mask
         rx_channels = effective_profile.channel.rx_mask.bit_count()
         
-        byte_plan = BytePlan(
-            adc_format="real_int16",
-            bytes_per_scalar_component=2,
-            components_per_sample=1,
-            bytes_per_adc_sample=2,
-            samples_per_chirp=profile.sampling.samples,
-            rx_channels=rx_channels,
-            chirps_per_frame=profile.frame.chirps_per_frame,
-            total_frames=resolved_frames,
-            canonical_frames=canonical_frames,
-            guard_frames=guard_frames,
-            dca_word_slots=4,
-            active_lanes=2,
-            dca_expansion_factor=2,
-            native_active_payload_bytes=resolved_frames * profile.frame.chirps_per_frame * rx_channels * profile.sampling.samples * 2,
-            native_dca_bytes=resolved_frames * profile.frame.chirps_per_frame * rx_channels * profile.sampling.samples * 2 * 2,
-            canonical_active_payload_bytes=canonical_frames * profile.frame.chirps_per_frame * rx_channels * profile.sampling.samples * 2,
-            canonical_dca_bytes=canonical_frames * profile.frame.chirps_per_frame * rx_channels * profile.sampling.samples * 2 * 2,
+        # Authoritative schedule comes from the exact commands that will be sent.
+        try:
+            schedule = resolve_schedule_from_cli(cli_commands)
+        except ChirpScheduleError as exc:
+            raise ValueError(f"Invalid chirp schedule: {exc}") from exc
+        _check_chirp_count_consistency(
+            schedule, profile.frame.chirps_per_frame, resolved_frames, "structured profile"
+        )
+        
+        byte_plan = _make_byte_plan(
+            schedule, rx_channels, profile.sampling.samples, canonical_frames, guard_frames
         )
         
         resolved_cfg_text = "\n".join(cli_commands) + "\n"
@@ -344,6 +688,15 @@ def resolve_capture_config(
             resolved_sha256=hashlib.sha256(resolved_cfg_text.encode("utf-8")).hexdigest(),
             derived={},
             preflight_warnings=[],
+            schedule=schedule,
+            capabilities=_build_capabilities(
+                schedule, dsp_profile, None, _structured_raw_block(effective_profile)
+            ),
+            capture_layout=build_capture_layout(
+                schedule, rx_channels, profile.sampling.samples, canonical_frames,
+                guard_frames, requires_schedule_aware_dsp=dsp_profile is None,
+                rx_mask=effective_profile.channel.rx_mask,
+            ),
         )
         
     elif isinstance(profile, (Path, MmwDemoConfig)):
@@ -366,14 +719,33 @@ def resolve_capture_config(
             source_kind = "mmw_demo_config"
             
         # Pre-extract to find native num_frames if frames is None
-        temp_meta = extract_capture_metadata(cfg)
+        try:
+            temp_meta = extract_capture_metadata(cfg)
+        except (ValueError, IndexError) as exc:
+            raise ValueError(f"Invalid or malformed configuration values: {exc}") from exc
+        extra_warnings: List[str] = []
+        if temp_meta.num_frames < 0:
+            raise ValueError(f"frameCfg numFrames {temp_meta.num_frames} is negative.")
+        if temp_meta.num_frames == 0:
+            # TI: numFrames=0 means INFINITE frames.  A finite byte-target capture
+            # cannot be derived from it.
+            if frames is None:
+                raise ValueError(
+                    "frameCfg numFrames=0 means INFINITE frames on TI firmware; a finite byte-target "
+                    "capture needs an explicit frame count (pass frames=N)."
+                )
+            extra_warnings.append(
+                "cfg frameCfg numFrames=0 (infinite) was overridden by an explicit finite frame count."
+            )
         canonical_frames = frames if frames is not None else temp_meta.num_frames
+        if canonical_frames < 1:
+            raise ValueError(f"Canonical frame count must be >= 1, got {canonical_frames}.")
         resolved_frames = canonical_frames + guard_frames
         
-        # Rewrite frameCfg numFrames to resolved native total before final extraction
+        # Rewrite ONLY frameCfg numFrames (arg index 3) to the resolved native total.
         new_lines = []
         for line in cfg.lines:
-            if line.is_command and line.command == "frameCfg" and len(line.args) >= 7:
+            if line.is_command and line.command == "frameCfg" and len(line.args) == 8:
                 args = list(line.args)
                 args[3] = str(resolved_frames)
                 new_lines.append(f"frameCfg {' '.join(args)}")
@@ -389,31 +761,32 @@ def resolve_capture_config(
         if errors:
             raise ValueError(f"Preflight validation failed: {errors}")
             
-        warnings = [i.message for i in issues if i.severity == "WARNING"]
+        warnings = [i.message for i in issues if i.severity == "WARNING"] + extra_warnings
+        if meta.rx_mask in UNVERIFIED_RX_MASKS:
+            warnings.append(
+                f"RX mask 0b{meta.rx_mask:04b} ({meta.rx_count} RX) is not hardware-verified in this "
+                "repository; only 4-RX (0b1111) captures have been validated on hardware."
+            )
         
         cli_commands = build_cli_commands(cfg, num_frames_override=None)
-        dsp_profile = build_dsp_profile(meta)
+        try:
+            schedule = resolve_schedule_from_cli(cli_commands)
+        except ChirpScheduleError as exc:
+            raise ValueError(f"Invalid chirp schedule: {exc}") from exc
+        _check_chirp_count_consistency(
+            schedule, meta.total_chirps_per_frame, resolved_frames, "cfg metadata"
+        )
         
-        logical_per_frame = meta.total_chirps_per_frame * meta.rx_count * meta.adc_samples * meta.bytes_per_adc_sample
+        prof_cmd = next((line for line in cfg.lines if line.command == "profileCfg"), None)
+        profile_id = int(prof_cmd.args[0]) if prof_cmd and prof_cmd.args else 0
+        dsp_block = legacy_dsp_block_reason(meta, schedule, profile_id)
+        dsp_profile = build_dsp_profile(meta, schedule, profile_id)
+        raw_block = raw_capture_block_reason(meta, schedule, profile_id, cfg=cfg)
         
-        byte_plan = BytePlan(
-            adc_format="real_int16" if not meta.is_complex else "complex_int16",
-            bytes_per_scalar_component=2,
-            components_per_sample=1 if not meta.is_complex else 2,
-            bytes_per_adc_sample=meta.bytes_per_adc_sample,
-            samples_per_chirp=meta.adc_samples,
-            rx_channels=meta.rx_count,
-            chirps_per_frame=meta.total_chirps_per_frame,
-            total_frames=resolved_frames,
-            canonical_frames=canonical_frames,
-            guard_frames=guard_frames,
-            dca_word_slots=4,
-            active_lanes=2,
-            dca_expansion_factor=2,
-            native_active_payload_bytes=resolved_frames * logical_per_frame,
-            native_dca_bytes=resolved_frames * logical_per_frame * 2,
-            canonical_active_payload_bytes=canonical_frames * logical_per_frame,
-            canonical_dca_bytes=canonical_frames * logical_per_frame * 2,
+        # preflight_validate has already rejected complex ADC formats, so the
+        # real-int16 schedule byte plan applies.
+        byte_plan = _make_byte_plan(
+            schedule, meta.rx_count, meta.adc_samples, canonical_frames, guard_frames
         )
         
         resolved_cfg_text = "\n".join(cli_commands) + "\n"
@@ -431,6 +804,13 @@ def resolve_capture_config(
             resolved_sha256=hashlib.sha256(resolved_cfg_text.encode("utf-8")).hexdigest(),
             derived=None,
             preflight_warnings=warnings,
+            schedule=schedule,
+            capabilities=_build_capabilities(schedule, dsp_profile, dsp_block, raw_block),
+            capture_layout=build_capture_layout(
+                schedule, meta.rx_count, meta.adc_samples, canonical_frames,
+                guard_frames, requires_schedule_aware_dsp=dsp_profile is None,
+                rx_mask=meta.rx_mask,
+            ),
         )
         
     else:

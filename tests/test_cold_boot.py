@@ -5,10 +5,7 @@ import sys
 
 def test_cold_boot_event_order(monkeypatch, tmp_path):
     """Verify exact event order during a full production cold boot."""
-    import sys
-    to_remove = [k for k in sys.modules if k.startswith("awr2944_dca")]
-    for k in to_remove:
-        del sys.modules[k]
+    # sys.modules hacking removed because it breaks isinstance and exceptions in subsequent tests.
         
     from awr2944_dca.capture_session import run_capture
     from awr2944_dca.dsp.config import RadarProfile
@@ -21,11 +18,14 @@ def test_cold_boot_event_order(monkeypatch, tmp_path):
     
     mock_uart_conn = MagicMock()
     mock_uart_conn.send_command.return_value = mock_cmd_res
+    mock_uart_conn.read_until_prompt.return_value = "mmwDemo:/>"
     
     class MockAwrUartConnection:
         def __init__(self, port, baud):
             self.port = port
             self.baud = baud
+            self._serial = MagicMock()
+            self._serial.read.return_value = b""
         def __enter__(self):
             return mock_uart_conn
         def __exit__(self, exc_type, exc_val, exc_tb):
@@ -38,6 +38,11 @@ def test_cold_boot_event_order(monkeypatch, tmp_path):
     mock_dca_cli.reset_fpga.return_value = DcaCmdResult("reset_fpga", [], 0, "", "", True, 0.1, "")
     mock_dca_cli.configure_fpga.return_value = DcaCmdResult("fpga", [], 0, "", "", True, 0.1, "")
     mock_dca_cli.configure_record.return_value = DcaCmdResult("record", [], 0, "", "", True, 0.1, "")
+    
+    fake_cf = tmp_path / "fake.json"
+    fake_cf.write_text("{}", encoding="utf-8")
+    mock_dca_cli._cf_json = fake_cf
+    mock_dca_cli.arm_record.return_value = DcaCmdResult("arm_record", [], 0, "", "", True, 0.1, "")
     
     mock_direct_udp = MagicMock()
     mock_direct_udp.start_record.return_value = True
@@ -101,8 +106,8 @@ def test_cold_boot_event_order(monkeypatch, tmp_path):
         assert mock_dca_cli.configure_fpga.call_count == 1
         assert mock_dca_cli.configure_record.call_count == 1
         
-        # Ensure start_record via DirectUdpCapture was called
-        assert mock_direct_udp.start_record.call_count == 1
+        # Ensure arm_record via DcaCli was called
+        assert mock_dca_cli.arm_record.call_count == 1
         
         # Assert UART calls include the config
         mock_uart_conn.send_command.assert_has_calls([

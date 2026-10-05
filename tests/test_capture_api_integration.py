@@ -168,9 +168,7 @@ class TestCaptureApiIntegration:
     def test_no_mmws_imports_during_capture_api_construction(self, tmp_path):
         """Verify no mmws modules are imported when using CaptureApi."""
         # Clear any cached imports
-        to_remove = [k for k in sys.modules if k.startswith("awr2944_dca")]
-        for k in to_remove:
-            del sys.modules[k]
+        # Removed sys.modules poisoning
         
         proj_dir = _make_minimal_project(tmp_path)
         _make_toolchain_config(proj_dir)

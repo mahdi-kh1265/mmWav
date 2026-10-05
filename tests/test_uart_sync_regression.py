@@ -698,9 +698,12 @@ class TestDfeDataOutputModeAsyncReboot:
 
         # serial.read should NOT be called during config commands
         # (only during sync phases which use read_until_prompt)
+        # The new pre-config drain loop will call read once, so we track calls > 1.
         serial_read_calls = [0]
         def tracking_read(size=1):
             serial_read_calls[0] += 1
+            import time
+            time.sleep(2.1)
             return b""
         mock_serial.read = tracking_read
 
@@ -745,10 +748,11 @@ class TestDfeDataOutputModeAsyncReboot:
                                 com_port="COM_FAKE",
                             )
 
-        # serial.read(1) settle calls should be 0 — no dfeDataOutputMode
-        assert serial_read_calls[0] == 0, (
+        # serial.read() is called once by the drain loop.
+        # It should not be called AGAIN since there's no dfeDataOutputMode.
+        assert serial_read_calls[0] == 1, (
             f"serial.read was called {serial_read_calls[0]} times "
-            f"but should not be called for non-dfeDataOutputMode commands"
+            f"but should only be called once by the drain loop."
         )
 
     def test_strict_invalid_command_unchanged(self):

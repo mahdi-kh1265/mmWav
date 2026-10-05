@@ -51,7 +51,7 @@ def _get_api_version() -> str:
     try:
         from awr2944_dca import __version__
         return __version__
-    except Exception:
+    except (ImportError, AttributeError):
         return "unknown"
 
 
@@ -63,7 +63,7 @@ def _write_atomic(path: Path, content: bytes) -> None:
     if path.exists():
         try:
             path.chmod(stat.S_IWRITE)
-        except Exception:
+        except OSError:
             pass
     tmp_path.replace(path)
 
@@ -300,6 +300,17 @@ def _run_capture_facade(
         guard_frames=guard_frames,
     )
     
+    # Explicit live-execution gate.  Runs BEFORE connection resolution, lock
+    # acquisition, session state transitions, directory creation or any
+    # UART/DCA/UDP access.  Configs that resolve and plan offline (e.g.
+    # multi-chirp TDM) are rejected here, not by an incidental DSP failure.
+    if not resolved_config.capabilities.can_execute_live:
+        from awr2944_dca.api._config_resolver import LiveExecutionNotEnabledError
+        raise LiveExecutionNotEnabledError(
+            resolved_config.capabilities.live_block_reason
+            or "Live execution is not enabled for this configuration."
+        )
+    
     sdk_cli_commands = resolved_config.cli_commands
     effective = resolved_config.structured_profile # Might be None
     
@@ -338,7 +349,13 @@ def _run_capture_facade(
             lease.acquire()
 
         # Get internal DspRadarProfile
-        dsp_profile = effective.to_dsp_profile()
+        # Frozen run_capture only needs frame/chirp/rx/sample counts.  Use the real
+        # DSP profile when one exists (unchanged manifest for smoke/single-chirp);
+        # otherwise the DSP-independent capture layout.  Never a fabricated profile.
+        dsp_profile = resolved_config.dsp_profile or resolved_config.capture_layout
+        if dsp_profile is None:  # defensive: gate above should make this unreachable
+            from awr2944_dca.api._config_resolver import LiveExecutionNotEnabledError
+            raise LiveExecutionNotEnabledError("No capture layout available for live capture.")
 
         # Build DCA CLI
         dca_cli = None
@@ -382,6 +399,25 @@ def _run_capture_facade(
         # Merge byte plan into summary
         import dataclasses
         config_summary.update(dataclasses.asdict(resolved_config.byte_plan))
+
+        # Schedule + raw layout provenance (reconstructs the physical chirp order).
+        if resolved_config.schedule is not None:
+            from awr2944_dca.capture_layout import schedule_to_dict
+            config_summary["schedule"] = schedule_to_dict(resolved_config.schedule)
+        if resolved_config.capture_layout is not None:
+            lay = resolved_config.capture_layout
+            config_summary["capture_layout"] = {
+                "canonical_cube_shape": list(lay.canonical_cube_shape),
+                "cube_axes": ["frame", "physical_chirp", "rx", "sample"],
+                "sample_format": lay.sample_format,
+                "bytes_per_sample": lay.bytes_per_sample,
+                "requires_schedule_aware_dsp": lay.requires_schedule_aware_dsp,
+                "rx_mask": lay.rx_mask,
+                "active_rx_channels": list(lay.active_rx_channels),
+                "rx_axis_note": "canonical RX axis index k = physical RX active_rx_channels[k] "
+                                "(ascending physical order)",
+            }
+        config_summary["capabilities"] = dataclasses.asdict(resolved_config.capabilities)
         
         # Write resolved config text
         _write_atomic(output_dir / "resolved_config.cfg", resolved_config.resolved_cfg_text.encode("utf-8"))

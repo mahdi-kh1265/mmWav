@@ -234,6 +234,56 @@ class CapturePlan:
         """Derived radar waveform metrics (bandwidth, range resolution, etc.)."""
         return dict(self._resolved.derived or {})
 
+    # -- schedule / capability view (offline planning only) -----------------
+
+    @property
+    def source_kind(self) -> str:
+        """Config source type: ``profile``, ``toml_file``, ``cfg_file`` or ``mmw_demo_config``."""
+        return self._resolved.source_kind
+
+    @property
+    def schedule(self) -> Any:
+        """Resolved :class:`~awr2944_dca.chirp_schedule.BasicFrameSchedule`."""
+        return self._resolved.schedule
+
+    @property
+    def chirps_per_cycle(self) -> int:
+        return self._resolved.schedule.chirps_per_cycle
+
+    @property
+    def loops_per_frame(self) -> int:
+        return self._resolved.schedule.loops_per_frame
+
+    @property
+    def physical_chirps_per_frame(self) -> int:
+        return self._resolved.schedule.physical_chirps_per_frame
+
+    @property
+    def tx_masks_per_cycle(self) -> tuple:
+        return self._resolved.schedule.tx_masks_per_cycle
+
+    @property
+    def rx_channels(self) -> int:
+        return self._resolved.byte_plan.rx_channels
+
+    @property
+    def samples_per_chirp(self) -> int:
+        return self._resolved.byte_plan.samples_per_chirp
+
+    @property
+    def capabilities(self) -> Any:
+        """:class:`~awr2944_dca.api._config_resolver.CaptureCapabilities`."""
+        return self._resolved.capabilities
+
+    @property
+    def can_execute_live(self) -> bool:
+        return self._resolved.capabilities.can_execute_live
+
+    @property
+    def live_block_reason(self) -> Optional[str]:
+        """Why live execution is blocked, or ``None`` if it is supported."""
+        return self._resolved.capabilities.live_block_reason
+
     # ------------------------------------------------------------------
     # Serialisation
     # ------------------------------------------------------------------
@@ -270,6 +320,16 @@ class CapturePlan:
               f"{self.guard_frames} guard = {self.total_frames} total")
         print(f"  Cube   : {list(self.cube_shape)}  [frames, chirps, rx, samples]")
         print(f"  Bytes  : native={bp.native_dca_bytes:,}  canonical={bp.canonical_dca_bytes:,}")
+        sched = self.schedule
+        if sched is not None:
+            print(f"  Source : {self.source_kind}")
+            print(f"  Chirps : {sched.chirps_per_cycle}/cycle x {sched.loops_per_frame} loops "
+                  f"= {sched.physical_chirps_per_frame} physical/frame")
+            print(f"  RX={self.rx_channels}  samples/chirp={self.samples_per_chirp}  "
+                  f"TX masks/cycle={list(sched.tx_masks_per_cycle)}")
+            print(f"  Live execution: {'supported' if self.can_execute_live else 'BLOCKED'}")
+            if self.live_block_reason:
+                print(f"    {self.live_block_reason}")
         print(f"  AWR commands ({len(self.awr_commands)}):")
         for cmd in self.awr_commands:
             print(f"    {cmd}")
