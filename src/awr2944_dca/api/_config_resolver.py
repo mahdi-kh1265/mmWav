@@ -152,7 +152,10 @@ def extract_capture_metadata(cfg: MmwDemoConfig) -> CfgCaptureMetadata:
     chirps_per_loop = (chirp_end - chirp_start + 1) if frame_cmd else 0
     num_loops = int(frame_cmd.args[2]) if frame_cmd and len(frame_cmd.args) >= 7 else 0
     num_frames = int(frame_cmd.args[3]) if frame_cmd and len(frame_cmd.args) >= 7 else 0
-    frame_period = float(frame_cmd.args[4]) if frame_cmd and len(frame_cmd.args) >= 7 else 0.0
+    # 7-arg: ... numFrames framePeriod trigger delay
+    # 8-arg (AWR294x): ... numFrames numAdcSamples framePeriod trigger delay
+    period_idx = 5 if (frame_cmd and len(frame_cmd.args) >= 8) else 4
+    frame_period = float(frame_cmd.args[period_idx]) if frame_cmd and len(frame_cmd.args) >= 7 else 0.0
     
     adc_bits = int(adc_cmd.args[0]) if adc_cmd and len(adc_cmd.args) >= 2 else 2
     adc_fmt = int(adc_cmd.args[1]) if adc_cmd and len(adc_cmd.args) >= 2 else 0
@@ -277,25 +280,81 @@ def build_cli_commands(cfg: MmwDemoConfig, num_frames_override: Optional[int] = 
     return tuple(commands)
 
 
-def build_dsp_profile(meta: CfgCaptureMetadata) -> Optional[DspRadarProfile]:
-    if meta.chirps_per_loop > 1:
-        # Multi-chirp TDM cannot be represented by DspRadarProfile correctly yet
-        return None
-        
-    try:
-        return DspRadarProfile(
-            start_frequency_hz=meta.start_freq_ghz * 1e9,
-            slope_hz_per_s=meta.slope_mhz_per_us * 1e12,
-            adc_sample_rate_hz=meta.sample_rate_ksps * 1e3,
-            adc_samples=meta.adc_samples,
-            idle_time_s=meta.idle_time_us * 1e-6,
-            ramp_end_time_s=meta.ramp_end_time_us * 1e-6,
-            chirps_per_frame=meta.total_chirps_per_frame,
-            rx_count=meta.rx_count,
-            tx_count=meta.tx_count,
+def legacy_dsp_block_reason(
+    meta: CfgCaptureMetadata,
+    schedule: Optional[BasicFrameSchedule],
+    profile_id: int = 0,
+) -> Optional[str]:
+    """Return why the flat legacy DspRadarProfile cannot faithfully represent this
+    configuration, or None if it can (single chirp definition, uniform TX)."""
+    if schedule is None:
+        return "No resolved chirp schedule."
+    if not schedule.is_single_chirp or meta.chirps_per_loop != 1:
+        return (
+            f"Multi-chirp schedule ({schedule.chirps_per_cycle} chirps/cycle, "
+            f"TX masks {schedule.tx_masks_per_cycle}) cannot be represented by the flat DSP profile."
         )
-    except Exception:
+    if not schedule.is_uniform_tx:
+        return "Non-uniform TX pattern cannot be represented by the flat DSP profile."
+    chirp = schedule.chirps[0]
+    if chirp.profile_id != profile_id:
+        return (
+            f"chirpCfg references profileId {chirp.profile_id} but the only profileCfg is id {profile_id}."
+        )
+    if (
+        chirp.start_freq_var_hz != 0.0
+        or chirp.freq_slope_var_mhz_per_us != 0.0
+        or chirp.idle_time_var_us != 0.0
+        or chirp.adc_start_time_var_us != 0.0
+    ):
+        return (
+            "chirpCfg applies per-chirp frequency/slope/idle/ADC-start variations that the flat "
+            "DSP profile does not represent."
+        )
+    if chirp.tx_enable_mask & ~meta.tx_mask:
+        return (
+            f"chirpCfg txEnable {chirp.tx_enable_mask} is not a subset of channelCfg "
+            f"txChannelEn {meta.tx_mask}."
+        )
+    if meta.rx_count < 1 or meta.adc_samples < 1:
+        return "Invalid RX count / sample count."
+    if meta.sample_rate_ksps <= 0 or meta.slope_mhz_per_us <= 0 or meta.start_freq_ghz <= 0:
+        return "Non-positive sample rate / slope / start frequency."
+    if meta.frame_period_ms <= 0:
+        return "Non-positive frame period."
+    return None
+
+
+def build_dsp_profile(
+    meta: CfgCaptureMetadata,
+    schedule: Optional[BasicFrameSchedule] = None,
+    profile_id: int = 0,
+) -> Optional[DspRadarProfile]:
+    """Map a resolved single-chirp basic-frame config onto the flat DSP profile.
+
+    Returns None (never a fabricated profile) if the config cannot be represented
+    faithfully.  ``frame_count`` is the native total (guard frames included), as in
+    the structured-profile path.
+    """
+    if schedule is None:
         return None
+    if legacy_dsp_block_reason(meta, schedule, profile_id) is not None:
+        return None
+    return DspRadarProfile(
+        start_frequency_hz=meta.start_freq_ghz * 1e9,
+        slope_hz_per_s=meta.slope_mhz_per_us * 1e12,
+        adc_sample_rate_hz=meta.sample_rate_ksps * 1e3,
+        adc_samples=meta.adc_samples,
+        idle_time_s=meta.idle_time_us * 1e-6,
+        ramp_end_time_s=meta.ramp_end_time_us * 1e-6,
+        chirps_per_frame=schedule.physical_chirps_per_frame,
+        frame_count=meta.num_frames,
+        frame_period_s=meta.frame_period_ms * 1e-3,
+        rx_count=meta.rx_count,
+        tx_mask=schedule.tx_masks_per_cycle[0],
+        sample_format="real_int16",
+        cube_layout="frame_chirp_rx_sample",
+    )
 
 
 def attempt_structured_conversion(cfg: MmwDemoConfig, meta: CfgCaptureMetadata) -> Optional[StructuredRadarProfile]:
@@ -325,12 +384,14 @@ def _check_chirp_count_consistency(
 def _build_capabilities(
     schedule: BasicFrameSchedule,
     dsp_profile: Optional[DspRadarProfile],
+    dsp_block_reason: Optional[str] = None,
 ) -> CaptureCapabilities:
     """Derive capabilities.  Live execution requires the legacy single-chirp path."""
     if dsp_profile is None:
         dsp_reason = (
             "The flat legacy DSP profile could not be built for this configuration "
-            f"({schedule.chirps_per_cycle} chirps/cycle, TX masks {schedule.tx_masks_per_cycle})."
+            f"({schedule.chirps_per_cycle} chirps/cycle, TX masks {schedule.tx_masks_per_cycle})"
+            + (f": {dsp_block_reason}" if dsp_block_reason else ".")
         )
     else:
         dsp_reason = None
@@ -522,8 +583,6 @@ def resolve_capture_config(
         warnings = [i.message for i in issues if i.severity == "WARNING"]
         
         cli_commands = build_cli_commands(cfg, num_frames_override=None)
-        dsp_profile = build_dsp_profile(meta)
-        
         try:
             schedule = resolve_schedule_from_cli(cli_commands)
         except ChirpScheduleError as exc:
@@ -531,6 +590,11 @@ def resolve_capture_config(
         _check_chirp_count_consistency(
             schedule, meta.total_chirps_per_frame, resolved_frames, "cfg metadata"
         )
+        
+        prof_cmd = next((line for line in cfg.lines if line.command == "profileCfg"), None)
+        profile_id = int(prof_cmd.args[0]) if prof_cmd and prof_cmd.args else 0
+        dsp_block = legacy_dsp_block_reason(meta, schedule, profile_id)
+        dsp_profile = build_dsp_profile(meta, schedule, profile_id)
         
         # preflight_validate has already rejected complex ADC formats, so the
         # real-int16 schedule byte plan applies.
@@ -554,7 +618,7 @@ def resolve_capture_config(
             derived=None,
             preflight_warnings=warnings,
             schedule=schedule,
-            capabilities=_build_capabilities(schedule, dsp_profile),
+            capabilities=_build_capabilities(schedule, dsp_profile, dsp_block),
         )
         
     else:

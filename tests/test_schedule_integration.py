@@ -163,11 +163,13 @@ def test_single_chirp_cfg_regression(project, tmp_path):
     assert res.byte_plan.canonical_dca_bytes == 4_194_304
     assert res.capabilities.can_resolve and res.capabilities.can_plan
     assert res.schedule.is_single_chirp
-    # Pre-existing baseline limitation (unchanged here): build_dsp_profile() returns
-    # None for every .cfg source, so cfg-sourced configs cannot run live yet.
-    assert res.dsp_profile is None
-    assert not res.capabilities.can_build_legacy_dsp_profile
-    assert not res.capabilities.can_execute_live
+    # Generic single-chirp basic-frame cfgs now build an accurate flat DSP profile.
+    assert res.dsp_profile is not None
+    assert res.dsp_profile.tx_mask == 1
+    assert res.dsp_profile.chirps_per_frame == 128
+    assert res.capabilities.can_build_legacy_dsp_profile
+    assert res.capabilities.can_execute_live
+    assert res.capabilities.live_block_reason is None
     assert "frameCfg 0 0 128 9 100 1 0" in res.resolved_cfg_text
 
 
@@ -440,13 +442,6 @@ def test_smoke_run_still_uses_production_path(project):
     assert res.capture_plan["expected_canonical_dca_bytes"] == 4_194_304
 
 
-def test_single_chirp_cfg_run_fails_cleanly_before_hardware(project, tmp_path):
-    """cfg sources have no legacy DSP profile on main (pre-existing); the gate now
-    reports that explicitly instead of an AttributeError after taking the lock."""
-    with _HardwareTripwire() as trip:
-        with pytest.raises(LiveExecutionNotEnabledError, match="legacy DSP profile"):
-            project.capture.run(profile=_cfg(tmp_path, SINGLE_CFG), frames=8, guard_frames=1)
-    assert trip.calls == []
 
 
 # 10. smoke CLI commands exactly unchanged -------------------------------------

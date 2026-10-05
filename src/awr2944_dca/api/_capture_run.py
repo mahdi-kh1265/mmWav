@@ -349,7 +349,10 @@ def _run_capture_facade(
             lease.acquire()
 
         # Get internal DspRadarProfile
-        dsp_profile = effective.to_dsp_profile()
+        dsp_profile = resolved_config.dsp_profile
+        if dsp_profile is None:  # defensive: gate above should make this unreachable
+            from awr2944_dca.api._config_resolver import LiveExecutionNotEnabledError
+            raise LiveExecutionNotEnabledError("No DSP profile available for live capture.")
 
         # Build DCA CLI
         dca_cli = None
