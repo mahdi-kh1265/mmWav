@@ -349,10 +349,13 @@ def _run_capture_facade(
             lease.acquire()
 
         # Get internal DspRadarProfile
-        dsp_profile = resolved_config.dsp_profile
+        # Frozen run_capture only needs frame/chirp/rx/sample counts.  Use the real
+        # DSP profile when one exists (unchanged manifest for smoke/single-chirp);
+        # otherwise the DSP-independent capture layout.  Never a fabricated profile.
+        dsp_profile = resolved_config.dsp_profile or resolved_config.capture_layout
         if dsp_profile is None:  # defensive: gate above should make this unreachable
             from awr2944_dca.api._config_resolver import LiveExecutionNotEnabledError
-            raise LiveExecutionNotEnabledError("No DSP profile available for live capture.")
+            raise LiveExecutionNotEnabledError("No capture layout available for live capture.")
 
         # Build DCA CLI
         dca_cli = None
@@ -396,6 +399,21 @@ def _run_capture_facade(
         # Merge byte plan into summary
         import dataclasses
         config_summary.update(dataclasses.asdict(resolved_config.byte_plan))
+
+        # Schedule + raw layout provenance (reconstructs the physical chirp order).
+        if resolved_config.schedule is not None:
+            from awr2944_dca.capture_layout import schedule_to_dict
+            config_summary["schedule"] = schedule_to_dict(resolved_config.schedule)
+        if resolved_config.capture_layout is not None:
+            lay = resolved_config.capture_layout
+            config_summary["capture_layout"] = {
+                "canonical_cube_shape": list(lay.canonical_cube_shape),
+                "cube_axes": ["frame", "physical_chirp", "rx", "sample"],
+                "sample_format": lay.sample_format,
+                "bytes_per_sample": lay.bytes_per_sample,
+                "requires_schedule_aware_dsp": lay.requires_schedule_aware_dsp,
+            }
+        config_summary["capabilities"] = dataclasses.asdict(resolved_config.capabilities)
         
         # Write resolved config text
         _write_atomic(output_dir / "resolved_config.cfg", resolved_config.resolved_cfg_text.encode("utf-8"))

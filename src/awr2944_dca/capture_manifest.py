@@ -5,13 +5,27 @@ from typing import Optional, Any
 from awr2944_dca.dsp.config import RadarProfile
 
 def profile_to_manifest_dict(profile: RadarProfile) -> dict[str, Any]:
-    """Serialize RadarProfile strictly to primitive Python types."""
+    """Serialize RadarProfile (or DSP-independent CaptureDataLayout) to primitive types."""
     d = asdict(profile)
     # Ensure no nested objects or enums leak into JSON
     return d
 
 def profile_from_manifest_dict(data: dict[str, Any]) -> RadarProfile:
-    """Deserialize RadarProfile strictly from primitive Python types."""
+    """Deserialize RadarProfile strictly from primitive Python types.
+
+    Raw-only captures (multi-chirp / schedules the flat DSP cannot represent) store a
+    capture layout instead of a DSP profile; legacy DSP must refuse them rather than
+    treat all physical chirps as one uniform slow-time stream.
+    """
+    if data.get("profile_kind") == "capture_layout":
+        from awr2944_dca.capture_layout import ScheduleAwareDspRequiredError
+        raise ScheduleAwareDspRequiredError(
+            "Capture is valid, but this chirp schedule "
+            f"({data.get('chirps_per_cycle')} chirps/cycle, TX masks "
+            f"{list(data.get('tx_masks_per_cycle', []))}) requires schedule-aware DSP. "
+            "Use raw access (capture.to_cube()); legacy range/Doppler processing and the "
+            "viewer are not valid for this capture."
+        )
     return RadarProfile(**data)
 
 @dataclass

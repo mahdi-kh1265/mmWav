@@ -124,13 +124,15 @@ def test_tx_masks(project, tmp_path):
 
 def test_chirp_tx_not_subset_of_channel_tx_blocked(project, tmp_path):
     r = res_for(project, tmp_path, make_cfg(tx=1, chirp_tx=2))
-    assert r.dsp_profile is None and not r.capabilities.can_execute_live
+    assert r.dsp_profile is None and not r.capabilities.can_build_legacy_dsp_profile
+    assert not r.capabilities.can_execute_live
     assert "subset" in r.capabilities.live_block_reason
 
 
-def test_per_chirp_variation_blocked(project, tmp_path):
+def test_per_chirp_variation_blocks_legacy_dsp_not_raw(project, tmp_path):
     r = res_for(project, tmp_path, make_cfg(extra_chirp="0 0 5 0"))  # idleTimeVar != 0
-    assert r.dsp_profile is None and not r.capabilities.can_execute_live
+    assert r.dsp_profile is None and not r.capabilities.can_build_legacy_dsp_profile
+    assert r.capabilities.can_execute_live
 
 
 def test_cube_examples(project, tmp_path):
@@ -154,10 +156,11 @@ def test_smoke_regression(project):
 
 
 # --- still blocked ------------------------------------------------------------
-def test_tdm_still_blocked(project, tmp_path):
+def test_tdm_resolves_raw_live_but_no_legacy_dsp(project, tmp_path):
     r = res_for(project, tmp_path, TDM2_CFG)
-    assert r.capabilities.can_plan and not r.capabilities.can_execute_live
+    assert r.capabilities.can_plan and r.capabilities.can_execute_live
     assert r.dsp_profile is None and not r.capabilities.can_build_legacy_dsp_profile
+    assert not r.capabilities.can_run_tdm_dsp
 
 
 def test_advanced_frame_still_blocked(project, tmp_path):
@@ -233,8 +236,9 @@ def test_generic_cfg_reaches_production_backend(project, tmp_path):
         assert (Path(cap_dir) / "config_summary.json").exists()
 
 
-def test_tdm_run_touches_no_hardware(project, tmp_path):
+def test_invalid_layout_run_touches_no_hardware(project, tmp_path):
+    from tests.test_schedule_integration import BAD_RAW_CFG
     with _HardwareTripwire() as trip:
         with pytest.raises(LiveExecutionNotEnabledError):
-            project.capture.run(profile=_cfg(tmp_path, TDM2_CFG), frames=8, guard_frames=1)
+            project.capture.run(profile=_cfg(tmp_path, BAD_RAW_CFG), frames=8, guard_frames=1)
     assert trip.calls == []

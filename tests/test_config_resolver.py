@@ -164,7 +164,8 @@ def test_multi_chirp_execution_rejected(tmp_path, dummy_project):
     assert not any(i.severity == "ERROR" for i in issues)
     res = resolve_capture_config(dummy_project, cfg_path, frames=8, guard_frames=1)
     assert res.capabilities.can_plan
-    assert not res.capabilities.can_execute_live
+    assert res.capabilities.can_execute_live  # raw capture decoupled from DSP
+    assert not res.capabilities.can_build_legacy_dsp_profile
 
 def test_advanced_frame_parse_succeeds(tmp_path):
     cfg_text = "advFrameCfg 1 2 3"

@@ -43,6 +43,11 @@ TDM3_CFG = (
     + "chirpCfg 0 0 0 0 0 0 0 1\nchirpCfg 1 1 0 0 0 0 0 4\nchirpCfg 2 2 0 0 0 0 0 2\n"
     + "frameCfg 0 2 32 8 100 1 0\n"
 )
+# Second chirp references a profileId that does not exist -> samples/chirp unprovable.
+BAD_RAW_CFG = (
+    COMMON
+    + "chirpCfg 0 0 0 0 0 0 0 1\nchirpCfg 1 1 1 0 0 0 0 2\nframeCfg 0 1 64 8 100 1 0\n"
+)
 
 SMOKE_GOLDEN_CLI = (
     'flushCfg', 'dfeDataOutputMode 1', 'channelCfg 15 7 0', 'adcCfg 2 0', 'adcbufCfg -1 1 1 1 1',
@@ -187,11 +192,11 @@ def test_two_tx_tdm_resolution(project, tmp_path):
     assert res.byte_plan.canonical_dca_bytes == 4_194_304
     c = res.capabilities
     assert c.can_resolve and c.can_compute_byte_plan and c.can_plan
-    assert not c.can_execute_live
     assert not c.can_build_legacy_dsp_profile
     assert res.dsp_profile is None
-    assert "multi-chirp execution is not yet enabled" in c.live_block_reason
-    assert "resolves and plans successfully" in c.live_block_reason
+    assert c.can_execute_live and c.live_block_reason is None
+    assert not c.can_run_tdm_dsp and not c.can_run_aoa
+    assert "cannot be represented by the flat DSP profile" in c.legacy_dsp_block_reason
 
 
 # 4. 3-TX TDM -----------------------------------------------------------------
@@ -205,7 +210,7 @@ def test_three_tx_tdm_resolution(project, tmp_path):
     assert s.expanded_tx_masks()[:6] == (1, 4, 2, 1, 4, 2)
     assert res.byte_plan.chirps_per_frame == 96
     assert res.byte_plan.canonical_dca_bytes == 4_194_304 * 96 // 128
-    assert not res.capabilities.can_execute_live
+    assert res.capabilities.can_execute_live  # raw capture decoupled from DSP
     assert res.dsp_profile is None
 
 
@@ -324,21 +329,24 @@ def test_plan_tdm_touches_no_hardware(project, tmp_path):
     assert plan.byte_plan.native_dca_bytes == 4_718_592
     assert plan.byte_plan.canonical_dca_bytes == 4_194_304
     assert plan.cube_shape == (8, 128, 4, 256)
-    assert plan.can_execute_live is False
-    assert "not yet enabled" in plan.live_block_reason
+    assert plan.can_execute_live is True
+    assert plan.live_block_reason is None
     assert plan.capabilities.can_plan
     # legacy dry_run contract unchanged and consistent
     assert plan.to_dict() == dry
     assert dry["hardware_touched"] is False
 
 
-def test_plan_print_shows_schedule_and_block(project, tmp_path, capsys):
+def test_plan_print_shows_schedule_and_live_status(project, tmp_path, capsys):
     plan = project.capture.plan(_cfg(tmp_path, TDM3_CFG), frames=8, guard_frames=1)
     plan.print()
     out = capsys.readouterr().out
     assert "3/cycle x 32 loops = 96 physical/frame" in out
     assert "TX masks/cycle=[1, 4, 2]" in out
-    assert "BLOCKED" in out
+    assert "Live execution: supported" in out
+    blocked = project.capture.plan(_cfg(tmp_path, BAD_RAW_CFG, "bad.cfg"), frames=8, guard_frames=1)
+    blocked.print()
+    assert "BLOCKED" in capsys.readouterr().out
 
 
 def test_dry_run_dict_keys_unchanged_for_smoke(project):
@@ -351,10 +359,10 @@ def test_dry_run_dict_keys_unchanged_for_smoke(project):
 
 # 9. capture.run(TDM) fails before ALL hardware calls --------------------------
 def test_run_tdm_blocked_before_any_hardware(project, tmp_path):
-    cfg = _cfg(tmp_path, TDM2_CFG)
+    cfg = _cfg(tmp_path, BAD_RAW_CFG)
     before = sorted(p.name for p in (project.root / "captures").iterdir())
     with _HardwareTripwire() as trip:
-        with pytest.raises(LiveExecutionNotEnabledError, match="live multi-chirp execution is not yet enabled"):
+        with pytest.raises(LiveExecutionNotEnabledError, match="live raw capture is not enabled"):
             project.capture.run(profile=cfg, frames=8, guard_frames=1, name="tdm_blocked")
     assert trip.calls == []
     assert sorted(p.name for p in (project.root / "captures").iterdir()) == before
@@ -363,7 +371,7 @@ def test_run_tdm_blocked_before_any_hardware(project, tmp_path):
 def test_run_tdm_three_tx_blocked(project, tmp_path):
     with _HardwareTripwire() as trip:
         with pytest.raises(LiveExecutionNotEnabledError):
-            project.capture.run(profile=_cfg(tmp_path, TDM3_CFG), frames=8, guard_frames=1)
+            project.capture.run(profile=_cfg(tmp_path, BAD_RAW_CFG), frames=8, guard_frames=1)
     assert trip.calls == []
 
 
@@ -389,19 +397,19 @@ def test_run_tdm_blocked_via_explicit_session_leaves_state_untouched(project, tm
     sess = FakeSession(project)
     with _HardwareTripwire() as trip:
         with pytest.raises(LiveExecutionNotEnabledError):
-            SessionCaptureApi(sess).run(profile=_cfg(tmp_path, TDM2_CFG), frames=8, guard_frames=1)
+            SessionCaptureApi(sess).run(profile=_cfg(tmp_path, BAD_RAW_CFG), frames=8, guard_frames=1)
     assert trip.calls == []
     assert not sess.entered and not sess.errored
 
 
 def test_live_gate_is_explicit_not_incidental(project, tmp_path):
     """The block comes from the capability gate, not from DSP profile construction."""
-    res = resolve_capture_config(project, _cfg(tmp_path, TDM2_CFG), frames=8, guard_frames=1)
+    res = resolve_capture_config(project, _cfg(tmp_path, BAD_RAW_CFG), frames=8, guard_frames=1)
     assert isinstance(res.capabilities, CaptureCapabilities)
     assert res.capabilities.can_execute_live is False
     with _HardwareTripwire():
         with pytest.raises(LiveExecutionNotEnabledError) as ei:
-            project.capture.run(profile=_cfg(tmp_path, TDM2_CFG, "c.cfg"), frames=8, guard_frames=1)
+            project.capture.run(profile=_cfg(tmp_path, BAD_RAW_CFG, "c.cfg"), frames=8, guard_frames=1)
     assert str(ei.value) == res.capabilities.live_block_reason
 
 

@@ -10,6 +10,7 @@ from awr2944_dca.chirp_schedule import (
     resolve_schedule_from_cli,
     schedule_byte_plan,
 )
+from awr2944_dca.capture_layout import CaptureDataLayout, build_capture_layout
 from awr2944_dca.dsp.config import RadarProfile as DspRadarProfile
 from awr2944_dca.mmw_demo_config import MmwDemoConfig, KNOWN_COMMANDS
 
@@ -123,6 +124,8 @@ class ResolvedCaptureConfig:
     # Authoritative basic-frame schedule (chirp cycle, loops, TX masks).
     schedule: Optional[BasicFrameSchedule] = None
     capabilities: CaptureCapabilities = field(default_factory=CaptureCapabilities)
+    # DSP-independent raw acquisition layout: [frame, physical_chirp, rx, sample].
+    capture_layout: Optional[CaptureDataLayout] = None
 
 
 def extract_capture_metadata(cfg: MmwDemoConfig) -> CfgCaptureMetadata:
@@ -361,6 +364,42 @@ def attempt_structured_conversion(cfg: MmwDemoConfig, meta: CfgCaptureMetadata) 
     return None
 
 
+def raw_capture_block_reason(
+    meta: CfgCaptureMetadata,
+    schedule: Optional[BasicFrameSchedule],
+    profile_id: int = 0,
+) -> Optional[str]:
+    """Why raw ADC capture cannot be executed live for this basic-frame config.
+
+    Returns None when the raw byte layout is fully deterministic: physical chirp
+    count, RX count and samples/chirp are known, every chirp uses the single
+    profileCfg (so samples/chirp is constant) and the ADC format is the supported
+    real int16 one (enforced by preflight).  Per-chirp TX masks and per-chirp RF
+    variations do NOT block raw capture; they only block the legacy flat DSP profile.
+    """
+    block = "Configuration resolves and plans successfully, but live raw capture is not enabled: "
+    if schedule is None:
+        return block + "no resolved chirp schedule."
+    for chirp in schedule.chirps:
+        if chirp.profile_id != profile_id:
+            return block + (
+                f"chirp {chirp.chirp_index} references profileId {chirp.profile_id} but the only "
+                f"profileCfg is id {profile_id}; samples/chirp cannot be proven."
+            )
+        if chirp.tx_enable_mask & ~meta.tx_mask:
+            return block + (
+                f"chirp {chirp.chirp_index} txEnable {chirp.tx_enable_mask} is not a subset of "
+                f"channelCfg txChannelEn {meta.tx_mask}."
+            )
+    if meta.rx_count < 1 or meta.adc_samples < 1:
+        return block + "invalid RX count / sample count."
+    if meta.bytes_per_adc_sample != 2 or meta.is_complex:
+        return block + "only real int16 ADC data has a known byte layout."
+    if schedule.physical_chirps_per_frame < 1:
+        return block + "physical chirp count is not positive."
+    return None
+
+
 def _check_chirp_count_consistency(
     schedule: BasicFrameSchedule,
     compat_chirps_per_frame: int,
@@ -385,6 +424,7 @@ def _build_capabilities(
     schedule: BasicFrameSchedule,
     dsp_profile: Optional[DspRadarProfile],
     dsp_block_reason: Optional[str] = None,
+    raw_block_reason: Optional[str] = None,
 ) -> CaptureCapabilities:
     """Derive capabilities.  Live execution requires the legacy single-chirp path."""
     if dsp_profile is None:
@@ -396,19 +436,8 @@ def _build_capabilities(
     else:
         dsp_reason = None
 
-    if not schedule.is_single_chirp:
-        live_reason = (
-            "Configuration resolves and plans successfully, but live multi-chirp execution "
-            f"is not yet enabled ({schedule.chirps_per_cycle} chirps/cycle, "
-            f"TX masks per cycle {schedule.tx_masks_per_cycle})."
-        )
-    elif dsp_profile is None:
-        live_reason = (
-            "Configuration resolves and plans successfully, but live execution is not enabled: "
-            + dsp_reason
-        )
-    else:
-        live_reason = None
+    # Raw capture eligibility is INDEPENDENT of DSP support.
+    live_reason = raw_block_reason
 
     return CaptureCapabilities(
         can_resolve=True,
@@ -535,6 +564,10 @@ def resolve_capture_config(
             preflight_warnings=[],
             schedule=schedule,
             capabilities=_build_capabilities(schedule, dsp_profile),
+            capture_layout=build_capture_layout(
+                schedule, rx_channels, profile.sampling.samples, canonical_frames,
+                guard_frames, requires_schedule_aware_dsp=dsp_profile is None,
+            ),
         )
         
     elif isinstance(profile, (Path, MmwDemoConfig)):
@@ -595,6 +628,7 @@ def resolve_capture_config(
         profile_id = int(prof_cmd.args[0]) if prof_cmd and prof_cmd.args else 0
         dsp_block = legacy_dsp_block_reason(meta, schedule, profile_id)
         dsp_profile = build_dsp_profile(meta, schedule, profile_id)
+        raw_block = raw_capture_block_reason(meta, schedule, profile_id)
         
         # preflight_validate has already rejected complex ADC formats, so the
         # real-int16 schedule byte plan applies.
@@ -618,7 +652,11 @@ def resolve_capture_config(
             derived=None,
             preflight_warnings=warnings,
             schedule=schedule,
-            capabilities=_build_capabilities(schedule, dsp_profile, dsp_block),
+            capabilities=_build_capabilities(schedule, dsp_profile, dsp_block, raw_block),
+            capture_layout=build_capture_layout(
+                schedule, meta.rx_count, meta.adc_samples, canonical_frames,
+                guard_frames, requires_schedule_aware_dsp=dsp_profile is None,
+            ),
         )
         
     else:
