@@ -5,9 +5,7 @@ SDK-demo UART radar control, DCA1000 raw capture over a native UDP receiver, pac
 integrity checking, canonical ADC cubes, Python range/Doppler DSP and a standalone
 MATLAB viewer.  No mmWave Studio GUI automation or Lua scripts are involved.
 
-> **Documentation:** <https://awr2944-dca-lab.readthedocs.io/> *(Read the Docs - enable
-> the project on readthedocs.org; until then build locally with
-> `sphinx-build -W -b html docs docs/_build/html`)*
+> **Documentation:** <https://awr2944-dca-lab.readthedocs.io/> 
 
 ## Install (current research use)
 
