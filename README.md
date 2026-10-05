@@ -1,176 +1,98 @@
-# mmWav
+# awr2944-dca-lab
 
-[![CI](https://github.com/mahdi-kh1265/awr2944-fmcw-radar/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/mahdi-kh1265/awr2944-fmcw-radar/actions/workflows/ci.yml) [![PyPI version](https://img.shields.io/pypi/v/awr2944-dca-lab.svg)](https://pypi.org/project/awr2944-dca-lab/) [![Python versions](https://img.shields.io/pypi/pyversions/awr2944-dca-lab.svg)](https://pypi.org/project/awr2944-dca-lab/) [![License](https://img.shields.io/github/license/mahdi-kh1265/awr2944-fmcw-radar.svg)](LICENSE)
+Python research toolkit for **TI AWR2944EVM + DCA1000EVM** raw ADC radar captures:
+SDK-demo UART radar control, DCA1000 raw capture over a native UDP receiver, packet
+integrity checking, canonical ADC cubes, Python range/Doppler DSP and a standalone
+MATLAB viewer.  No mmWave Studio GUI automation or Lua scripts are involved.
 
-A Python research toolkit for TI AWR2944EVM + DCA1000EVM raw ADC radar captures.
+> **Documentation:** <https://awr2944-dca-lab.readthedocs.io/> *(Read the Docs - enable
+> the project on readthedocs.org; until then build locally with
+> `sphinx-build -W -b html docs docs/_build/html`)*
 
-This package provides a robust, native direct-capture pipeline that is free from mmWave Studio GUI automation and Lua scripts.
+## Install (current research use)
 
-## Installation
-
-```bash
-pip install awr2944-dca-lab
-```
-
-To include the optional MATLAB viewer bridge dependencies (Windows only):
-
-```bash
-pip install "awr2944-dca-lab[viewer]"
-```
-
-## Prerequisites
-
-- **TI mmWave SDK tools** and **DCA1000 CLI software** (external, installed separately)
-- **MATLAB** (required only for the `viewer` component)
-- A **dedicated wired Ethernet adapter** (or USB-Ethernet adapter) for the DCA1000 connection
-
----
-
-## One-Time Machine Setup
-
-> **This section describes the one-time per-machine setup.**
-> Most steps only need to be repeated if you change hardware or reinstall Windows.
-
-### Step 1 — Install the package
+Install the Git checkout. The PyPI `0.1.0` release is **stale** and predates the
+generic `.cfg` capture work.
 
 ```bash
-pip install awr2944-dca-lab
+git clone https://github.com/mahdi-kh1265/mmWav.git
+cd mmWav
+
+py -3.12 -m venv .venv
+.venv\Scripts\activate
+python -m pip install --upgrade pip
+python -m pip install -e .
 ```
 
-### Step 2 — Initialize a project
+Requires Windows, Python 3.12, and the separately installed TI mmWave Studio /
+DCA1000 CLI tools. MATLAB is needed only for the optional viewer
+(`pip install -e ".[viewer]"`).
+
+## Quick start: generic `.cfg` capture
 
 ```python
+from pathlib import Path
 from awr2944_dca import RadarProject
 
-p = RadarProject.init_here()   # creates project scaffold in current directory
-# or: p = RadarProject.open("path/to/existing/project")
-```
-
-### Step 3 — Detect AWR2944 serial interfaces
-
-```python
+p = RadarProject.init_here()                      # or RadarProject.open_here()
 p.hardware.autodetect_serial(save=True)
-```
-
-Discovers the XDS110 COM ports used by the AWR2944EVM and saves them to
-`.awr2944/local.toml`. Run with the AWR2944EVM powered and connected via USB.
-
-### Step 4 — Detect TI DCA1000 toolchain
-
-```python
 p.hardware.autodetect_toolchain(save=True)
+p.eth.instructions().print()                      # read-only
+p.doctor().print()                                # all required checks PASS
+
+cfg = Path(r"C:\path\to\profile.cfg")             # a Path, not a str
+
+plan = p.capture.plan(profile=cfg, frames=8, guard_frames=1)   # offline, no hardware
+plan.print()
+
+result = p.capture.run(profile=cfg, frames=8, name="experiment_001", guard_frames=1)
+
+cap = result.capture
+cap.verify(strict=True)                           # packet gaps, byte counts, hashes, shape
+cube = cap.raw.to_cube()                          # [frame, physical_chirp, rx, sample]
 ```
 
-Scans `C:\ti\mmwave_studio_*` for a complete DCA1000 toolchain (CLI executables,
-RF API DLL, `cf.json`) and saves the paths to `.awr2944/local.toml`.
+See the documentation for machine setup, the support matrix, capture artifacts and
+troubleshooting.
 
-### Step 5 — Inspect Ethernet adapters
+## Supported scope
 
-```python
-p.hardware.discover("network")   # shows all adapters and their metadata
-p.eth.status()                   # shows DCA readiness vs. project config
-p.eth.instructions()             # shows exactly how to configure a dedicated NIC
-```
-
-> These calls are **entirely read-only** — they never change any network settings.
-
-### Step 6 — Manually configure the dedicated DCA NIC in Windows
-
-> ### ⚠ Important — Read Before Configuring
->
-> - Use a **dedicated Ethernet port or USB-Ethernet adapter** for the DCA1000.
->   Do not use your main Internet/campus Ethernet port.
->
-> - **DO NOT** assign `192.168.33.30` to the NIC that carries your normal
->   Internet connection or default gateway.  Doing so will break Internet access.
->
-> - The DCA1000 may **not respond to ICMP ping** — this is normal and expected.
->   Use `p.doctor()` or `p.dca.verify()` for aliveness checks, not ping.
->
-> - Static NIC configuration is normally a **one-time per-machine** step.
->
-> - **Package Ethernet helpers are read-only in the normal workflow.**
-
-Open **Windows Settings → Network → Change adapter options**, right-click the
-dedicated adapter → **Properties → IPv4 → Use the following IP address**:
-
-| Setting     | Value             |
-|-------------|-------------------|
-| IP address  | `192.168.33.30`   |
-| Subnet mask | `255.255.255.0`   |
-| Gateway     | *(leave blank)*   |
-| DNS         | *(leave blank)*   |
-
-The DCA1000 board default address is `192.168.33.180`.
-
-Run `p.eth.instructions().print()` to see the exact values for your project.
-
-### Step 7 — Verify readiness
-
-```python
-p.doctor().print()
-```
-
-A fully-ready system shows all required checks as **PASS**.
-Follow any FAIL guidance to fix configuration issues.
-
-### Step 8 — Plan a capture (dry-run, no hardware needed)
-
-```python
-plan = p.capture.plan(
-    profile="smoke_v1",
-    frames=8,
-    guard_frames=1,
-)
-plan          # Jupyter display
-plan.print()  # terminal display
-```
-
-### Step 9 — Capture
-
-```python
-result = p.capture.run_smoke(
-    name="demo",
-    frames=8,
-    guard_frames=1,
-)
-```
-
----
+* **Live raw capture:** AWR2944 SDK-demo *basic-frame* configs, a single `profileCfg`,
+  one or many `chirpCfg` (including multi-chirp / TDM), 4 RX (and supported 2-RX
+  masks with a warning), real int16 ADC, finite frame counts.
+* **Fail closed:** `advFrameCfg`, `subFrameCfg`, `advChirpCfg`, `LUTDataCfg`, multiple
+  `profileCfg`, complex ADC, 1/3 RX, odd sample counts, hardware trigger, unknown
+  commands, and infinite frame mode (`numFrames 0`) unless `frames=` is given.
+* **Raw capture is not DSP support.** Range/Doppler DSP and the MATLAB viewer support
+  single-chirp captures. For multi-chirp/TDM captures the raw cube is valid but
+  schedule-aware Doppler and AoA are **not implemented**; the package raises
+  `ScheduleAwareDspRequiredError` rather than produce misleading results.
 
 ## Architecture
 
-The production capture chain uses:
 1. SDK Demo UART CLI for radar configuration
 2. TI DCA1000 CLI utilities (external) for FPGA initialization
 3. Native direct UDP capture with zero-copy stream processing and metadata logging
 4. Sequence/counter validation and DCA depadding
 5. Canonical ADC cube extraction
-6. Python DSP and standalone MATLAB viewer `buildMmwsCompatibleShell.m`
+6. Python DSP and standalone MATLAB viewer
 
-Historical mmWave Studio GUI automation is available as an optional `legacy-mmws`
-dependency extra for compatibility and debugging.
+Historical mmWave Studio GUI automation remains an optional `legacy-mmws` extra for
+compatibility and debugging only.
 
----
+## Ethernet safety notes
 
-## Ethernet Safety Notes
+* Use a **dedicated** Ethernet adapter for the DCA1000 (host `192.168.33.30/24`,
+  DCA `192.168.33.180`, **no gateway, no DNS**). Never assign that address to the
+  adapter carrying your Internet connection.
+* The DCA1000 may not answer ping. `p.doctor()` and `p.dca.verify()` are the
+  authoritative checks.
+* `p.eth.status()`, `p.eth.instructions()` and `p.doctor()` are **read-only**. The
+  low-level `p.eth.configure()`, `p.eth.repair()` and `p.eth.pair()` can modify NIC
+  settings and are for advanced/development use only.
 
-- The normal user-facing Ethernet API (`p.eth.status()`, `p.eth.instructions()`,
-  `p.doctor()`) is **read-only** — it never modifies Windows networking.
-- Low-level helpers (`p.eth.configure()`, `p.eth.repair()`, `p.eth.pair()`) are
-  preserved for advanced/development use.  They may mutate NIC settings.
-  Their docstrings carry explicit **Advanced/unsafe** warnings.
-- Never configure a default-gateway adapter for the DCA1000.
-  The package will warn you if it detects this situation.
-- The DCA1000 does not typically respond to ICMP ping; TCP/UDP connectivity
-  via `query_sys_status` (`p.dca.verify()`) is the authoritative aliveness test.
+## Reference documents
 
----
-
-## Reference Documents
-
-TI PDFs in `reference_docs/`:
-- AWR2944EVM user guide (SPRUJ22C)
-- DCA1000 + mmWave Studio raw capture training
-- SWRA581B ADC raw data capture app report
-- mmwaveSensing FMCW offline viewing deck (radar formulas)
+TI PDFs in `reference_docs/`: AWR2944EVM user guide (SPRUJ22C), DCA1000 + mmWave
+Studio raw capture training, SWRA581B ADC raw data capture app report, and the
+mmwaveSensing FMCW offline viewing deck. Older design notes are in `docs/*.md`.
