@@ -51,7 +51,7 @@ def _get_api_version() -> str:
     try:
         from awr2944_dca import __version__
         return __version__
-    except Exception:
+    except (ImportError, AttributeError):
         return "unknown"
 
 
@@ -63,7 +63,7 @@ def _write_atomic(path: Path, content: bytes) -> None:
     if path.exists():
         try:
             path.chmod(stat.S_IWRITE)
-        except Exception:
+        except OSError:
             pass
     tmp_path.replace(path)
 
@@ -412,6 +412,10 @@ def _run_capture_facade(
                 "sample_format": lay.sample_format,
                 "bytes_per_sample": lay.bytes_per_sample,
                 "requires_schedule_aware_dsp": lay.requires_schedule_aware_dsp,
+                "rx_mask": lay.rx_mask,
+                "active_rx_channels": list(lay.active_rx_channels),
+                "rx_axis_note": "canonical RX axis index k = physical RX active_rx_channels[k] "
+                                "(ascending physical order)",
             }
         config_summary["capabilities"] = dataclasses.asdict(resolved_config.capabilities)
         

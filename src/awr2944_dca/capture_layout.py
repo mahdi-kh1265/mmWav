@@ -50,6 +50,11 @@ class CaptureDataLayout:
     profile_kind: str = PROFILE_KIND_CAPTURE_LAYOUT
     requires_schedule_aware_dsp: bool = False
 
+    # RX provenance: rx_mask is channelCfg rxChannelEn.  Canonical RX axis index k is
+    # the k-th LOWEST set bit (CBUFF streams active RX in ascending physical order).
+    rx_mask: int = 0
+    active_rx_channels: tuple = ()
+
     @property
     def canonical_cube_shape(self) -> tuple[int, int, int, int]:
         return (self.canonical_frames, self.chirps_per_frame, self.rx_count, self.adc_samples)
@@ -62,7 +67,13 @@ def build_capture_layout(
     canonical_frames: int,
     guard_frames: int,
     requires_schedule_aware_dsp: bool,
+    rx_mask: int = 0,
 ) -> CaptureDataLayout:
+    if rx_mask == 0:
+        rx_mask = (1 << rx_count) - 1  # legacy contiguous default
+    active = tuple(i for i in range(8) if rx_mask >> i & 1)
+    if len(active) != rx_count:
+        raise ValueError(f"rx_mask 0b{rx_mask:b} has {len(active)} RX but rx_count={rx_count}.")
     return CaptureDataLayout(
         frame_count=canonical_frames + guard_frames,
         guard_frames=guard_frames,
@@ -76,6 +87,8 @@ def build_capture_layout(
         loops_per_frame=schedule.loops_per_frame,
         tx_masks_per_cycle=tuple(schedule.tx_masks_per_cycle),
         requires_schedule_aware_dsp=requires_schedule_aware_dsp,
+        rx_mask=rx_mask,
+        active_rx_channels=active,
     )
 
 

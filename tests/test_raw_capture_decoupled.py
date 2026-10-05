@@ -208,13 +208,13 @@ def test_per_chirp_rf_variation_accepted_for_raw(project, tmp_path):
 
 # 12-15. still rejected / zero hardware ------------------------------------------------
 def test_undefined_chirp_rejected(project, tmp_path):
-    text = COMMON + "chirpCfg 0 0 0 0 0 0 0 1\nframeCfg 0 1 64 8 100 1 0\n"
+    text = COMMON + "chirpCfg 0 0 0 0 0 0 0 1\nframeCfg 0 1 64 8 256 100 1 0\n"
     with pytest.raises(ValueError, match="no chirpCfg defines it"):
         res_for(project, tmp_path, text)
 
 
 def test_ambiguous_chirp_rejected(project, tmp_path):
-    text = COMMON + "chirpCfg 0 1 0 0 0 0 0 1\nchirpCfg 1 1 0 0 0 0 0 2\nframeCfg 0 1 64 8 100 1 0\n"
+    text = COMMON + "chirpCfg 0 1 0 0 0 0 0 1\nchirpCfg 1 1 0 0 0 0 0 2\nframeCfg 0 1 64 8 256 100 1 0\n"
     with pytest.raises(ValueError, match="overlapping"):
         res_for(project, tmp_path, text)
 

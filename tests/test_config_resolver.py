@@ -44,7 +44,7 @@ adcCfg 2 0
 adcbufCfg -1 1 1 1 1
 profileCfg 0 77 429 7 57.14 0 0 70 1 256 5209 0 0 30
 chirpCfg 0 0 0 0 0 0 0 1
-frameCfg 0 0 128 8 100 1 0
+frameCfg 0 0 128 8 256 100 1 0
 sensorStart
 """
     cfg_path = tmp_path / "simple.cfg"
@@ -56,12 +56,13 @@ sensorStart
 
 def test_resolve_from_mmw_demo_config(dummy_project, tmp_path):
     cfg_text = """
+dfeDataOutputMode 1
 channelCfg 15 7 0
 adcCfg 2 0
 adcbufCfg -1 1 1 1 1
 profileCfg 0 77 429 7 57.14 0 0 70 1 256 5209 0 0 30
 chirpCfg 0 0 0 0 0 0 0 1
-frameCfg 0 0 128 8 100 1 0
+frameCfg 0 0 128 8 256 100 1 0
 """
     cfg_path = tmp_path / "temp.cfg"
     cfg_path.write_text(cfg_text, encoding="utf-8")
@@ -92,7 +93,7 @@ def test_byte_plan_explicit_units(dummy_project):
 
 # ADC format 10-13
 def test_adc_format_conflict_adcCfg_complex_rejected(tmp_path):
-    cfg_text = "channelCfg 15 7 0\nadcCfg 2 1\nadcbufCfg -1 1 1 1 1\nprofileCfg 0 77 429 7 57.14 0 0 70 1 256 5209 0 0 30\nchirpCfg 0 0 0 0 0 0 0 1\nframeCfg 0 0 128 8 100 1 0"
+    cfg_text = "dfeDataOutputMode 1\nchannelCfg 15 7 0\nadcCfg 2 1\nadcbufCfg -1 1 1 1 1\nprofileCfg 0 77 429 7 57.14 0 0 70 1 256 5209 0 0 30\nchirpCfg 0 0 0 0 0 0 0 1\nlvdsStreamCfg -1 0 1 0\nframeCfg 0 0 128 8 256 100 1 0"
     cfg_path = tmp_path / "temp.cfg"
     cfg_path.write_text(cfg_text)
     cfg = MmwDemoConfig.from_cfg_file(cfg_path)
@@ -101,7 +102,7 @@ def test_adc_format_conflict_adcCfg_complex_rejected(tmp_path):
     assert any(i.severity == "ERROR" and "adcCfg b2AdcOutFmt" in i.message for i in issues)
 
 def test_adc_format_conflict_adcbufCfg_complex_rejected(tmp_path):
-    cfg_text = "channelCfg 15 7 0\nadcCfg 2 0\nadcbufCfg -1 0 1 1 1\nprofileCfg 0 77 429 7 57.14 0 0 70 1 256 5209 0 0 30\nchirpCfg 0 0 0 0 0 0 0 1\nframeCfg 0 0 128 8 100 1 0"
+    cfg_text = "dfeDataOutputMode 1\nchannelCfg 15 7 0\nadcCfg 2 0\nadcbufCfg -1 0 1 1 1\nprofileCfg 0 77 429 7 57.14 0 0 70 1 256 5209 0 0 30\nchirpCfg 0 0 0 0 0 0 0 1\nlvdsStreamCfg -1 0 1 0\nframeCfg 0 0 128 8 256 100 1 0"
     cfg_path = tmp_path / "temp.cfg"
     cfg_path.write_text(cfg_text)
     cfg = MmwDemoConfig.from_cfg_file(cfg_path)
@@ -110,7 +111,7 @@ def test_adc_format_conflict_adcbufCfg_complex_rejected(tmp_path):
     assert any(i.severity == "ERROR" and "adcbufCfg adcFmt" in i.message for i in issues)
 
 def test_adc_format_conflict_adcCfg_missing_rejected(tmp_path):
-    cfg_text = "channelCfg 15 7 0\nadcbufCfg -1 1 1 1 1\nprofileCfg 0 77 429 7 57.14 0 0 70 1 256 5209 0 0 30\nchirpCfg 0 0 0 0 0 0 0 1\nframeCfg 0 0 128 8 100 1 0"
+    cfg_text = "dfeDataOutputMode 1\nchannelCfg 15 7 0\nadcbufCfg -1 1 1 1 1\nprofileCfg 0 77 429 7 57.14 0 0 70 1 256 5209 0 0 30\nchirpCfg 0 0 0 0 0 0 0 1\nlvdsStreamCfg -1 0 1 0\nframeCfg 0 0 128 8 256 100 1 0"
     cfg_path = tmp_path / "temp.cfg"
     cfg_path.write_text(cfg_text)
     cfg = MmwDemoConfig.from_cfg_file(cfg_path)
@@ -119,7 +120,7 @@ def test_adc_format_conflict_adcCfg_missing_rejected(tmp_path):
     assert any(i.severity == "ERROR" and "Missing adcCfg" in i.message for i in issues)
 
 def test_adc_format_conflict_adcbufCfg_missing_rejected(tmp_path):
-    cfg_text = "channelCfg 15 7 0\nadcCfg 2 0\nprofileCfg 0 77 429 7 57.14 0 0 70 1 256 5209 0 0 30\nchirpCfg 0 0 0 0 0 0 0 1\nframeCfg 0 0 128 8 100 1 0"
+    cfg_text = "dfeDataOutputMode 1\nchannelCfg 15 7 0\nadcCfg 2 0\nprofileCfg 0 77 429 7 57.14 0 0 70 1 256 5209 0 0 30\nchirpCfg 0 0 0 0 0 0 0 1\nlvdsStreamCfg -1 0 1 0\nframeCfg 0 0 128 8 256 100 1 0"
     cfg_path = tmp_path / "temp.cfg"
     cfg_path.write_text(cfg_text)
     cfg = MmwDemoConfig.from_cfg_file(cfg_path)
@@ -136,7 +137,7 @@ def test_unknown_command_parse_succeeds(tmp_path):
     assert len(cfg.lines) > 0
 
 def test_unknown_command_capture_rejected(tmp_path):
-    cfg_text = "fakeCommand 1 2 3\nchannelCfg 15 7 0\nadcCfg 2 0\nadcbufCfg -1 1 1 1 1\nprofileCfg 0 77 429 7 57.14 0 0 70 1 256 5209 0 0 30\nchirpCfg 0 0 0 0 0 0 0 1\nframeCfg 0 0 128 8 100 1 0"
+    cfg_text = "fakeCommand 1 2 3\ndfeDataOutputMode 1\nchannelCfg 15 7 0\nadcCfg 2 0\nadcbufCfg -1 1 1 1 1\nprofileCfg 0 77 429 7 57.14 0 0 70 1 256 5209 0 0 30\nchirpCfg 0 0 0 0 0 0 0 1\nlvdsStreamCfg -1 0 1 0\nframeCfg 0 0 128 8 256 100 1 0"
     cfg_path = tmp_path / "temp.cfg"
     cfg_path.write_text(cfg_text)
     cfg = MmwDemoConfig.from_cfg_file(cfg_path)
@@ -155,7 +156,7 @@ def test_multi_chirp_parse_succeeds(tmp_path):
 def test_multi_chirp_execution_rejected(tmp_path, dummy_project):
     # Superseded semantics: multi-TX configs now resolve/plan offline (no blanket
     # preflight error) but live execution is blocked via capabilities.
-    cfg_text = "channelCfg 15 7 0\nadcCfg 2 0\nadcbufCfg -1 1 1 1 1\nprofileCfg 0 77 429 7 57.14 0 0 70 1 256 5209 0 0 30\nchirpCfg 0 0 0 0 0 0 0 1\nchirpCfg 1 1 0 0 0 0 0 2\nframeCfg 0 1 64 8 100 1 0"
+    cfg_text = "dfeDataOutputMode 1\nchannelCfg 15 7 0\nadcCfg 2 0\nadcbufCfg -1 1 1 1 1\nprofileCfg 0 77 429 7 57.14 0 0 70 1 256 5209 0 0 30\nchirpCfg 0 0 0 0 0 0 0 1\nchirpCfg 1 1 0 0 0 0 0 2\nlvdsStreamCfg -1 0 1 0\nframeCfg 0 1 64 8 256 100 1 0"
     cfg_path = tmp_path / "temp.cfg"
     cfg_path.write_text(cfg_text)
     cfg = MmwDemoConfig.from_cfg_file(cfg_path)
@@ -175,7 +176,7 @@ def test_advanced_frame_parse_succeeds(tmp_path):
     assert len(cfg.lines) == 1
 
 def test_advanced_frame_execution_rejected(tmp_path):
-    cfg_text = "channelCfg 15 7 0\nadcCfg 2 0\nadcbufCfg -1 1 1 1 1\nprofileCfg 0 77 429 7 57.14 0 0 70 1 256 5209 0 0 30\nchirpCfg 0 0 0 0 0 0 0 1\nadvFrameCfg 1 2 3"
+    cfg_text = "dfeDataOutputMode 1\nchannelCfg 15 7 0\nadcCfg 2 0\nadcbufCfg -1 1 1 1 1\nprofileCfg 0 77 429 7 57.14 0 0 70 1 256 5209 0 0 30\nchirpCfg 0 0 0 0 0 0 0 1\nadvFrameCfg 1 2 3"
     cfg_path = tmp_path / "temp.cfg"
     cfg_path.write_text(cfg_text)
     cfg = MmwDemoConfig.from_cfg_file(cfg_path)
@@ -184,7 +185,7 @@ def test_advanced_frame_execution_rejected(tmp_path):
     assert any(i.severity == "ERROR" and "Advanced frame" in i.message for i in issues)
 
 def test_multi_chirp_dsp_profile_is_none(tmp_path, dummy_project):
-    cfg_text = "channelCfg 15 7 0\nadcCfg 2 0\nadcbufCfg -1 1 1 1 1\nprofileCfg 0 77 429 7 57.14 0 0 70 1 256 5209 0 0 30\nchirpCfg 0 0 0 0 0 0 0 1\nchirpCfg 1 1 0 0 0 0 0 2\nframeCfg 0 1 64 8 100 1 0"
+    cfg_text = "dfeDataOutputMode 1\nchannelCfg 15 7 0\nadcCfg 2 0\nadcbufCfg -1 1 1 1 1\nprofileCfg 0 77 429 7 57.14 0 0 70 1 256 5209 0 0 30\nchirpCfg 0 0 0 0 0 0 0 1\nchirpCfg 1 1 0 0 0 0 0 2\nlvdsStreamCfg -1 0 1 0\nframeCfg 0 1 64 8 256 100 1 0"
     cfg_path = tmp_path / "temp.cfg"
     cfg_path.write_text(cfg_text)
     res = resolve_capture_config(dummy_project, cfg_path, frames=8, guard_frames=1)
@@ -202,7 +203,7 @@ def test_source_cfg_preserved_verbatim(dummy_project):
     pass
 
 def test_resolved_cfg_normalized(dummy_project, tmp_path):
-    cfg_text = "channelCfg 15 7 0\r\nadcCfg 2 0\nadcbufCfg -1 1 1 1 1\r\nprofileCfg 0 77 429 7 57.14 0 0 70 1 256 5209 0 0 30\nchirpCfg 0 0 0 0 0 0 0 1\nframeCfg 0 0 128 8 100 1 0"
+    cfg_text = "dfeDataOutputMode 1\nchannelCfg 15 7 0\r\nadcCfg 2 0\nadcbufCfg -1 1 1 1 1\r\nprofileCfg 0 77 429 7 57.14 0 0 70 1 256 5209 0 0 30\nchirpCfg 0 0 0 0 0 0 0 1\nlvdsStreamCfg -1 0 1 0\nframeCfg 0 0 128 8 256 100 1 0"
     cfg_path = tmp_path / "simple.cfg"
     cfg_path.write_text(cfg_text, encoding="utf-8")
     res = resolve_capture_config(dummy_project, cfg_path, frames=8, guard_frames=1)
@@ -210,7 +211,7 @@ def test_resolved_cfg_normalized(dummy_project, tmp_path):
     assert res.resolved_cfg_text.endswith("\n")
 
 def test_resolved_sha256_deterministic(dummy_project, tmp_path):
-    cfg_text = "channelCfg 15 7 0\nadcCfg 2 0\nadcbufCfg -1 1 1 1 1\nprofileCfg 0 77 429 7 57.14 0 0 70 1 256 5209 0 0 30\nchirpCfg 0 0 0 0 0 0 0 1\nframeCfg 0 0 128 8 100 1 0"
+    cfg_text = "dfeDataOutputMode 1\nchannelCfg 15 7 0\nadcCfg 2 0\nadcbufCfg -1 1 1 1 1\nprofileCfg 0 77 429 7 57.14 0 0 70 1 256 5209 0 0 30\nchirpCfg 0 0 0 0 0 0 0 1\nlvdsStreamCfg -1 0 1 0\nframeCfg 0 0 128 8 256 100 1 0"
     cfg_path = tmp_path / "simple.cfg"
     cfg_path.write_text(cfg_text, encoding="utf-8")
     res1 = resolve_capture_config(dummy_project, cfg_path, frames=8, guard_frames=1)
@@ -228,7 +229,7 @@ def test_source_sha256_is_raw_bytes(dummy_project, tmp_path):
 
 # UART command filtering 27-28
 def test_no_sensorStop_sensorStart_in_resolved(dummy_project, tmp_path):
-    cfg_text = "sensorStop\nchannelCfg 15 7 0\nadcCfg 2 0\nadcbufCfg -1 1 1 1 1\nprofileCfg 0 77 429 7 57.14 0 0 70 1 256 5209 0 0 30\nchirpCfg 0 0 0 0 0 0 0 1\nframeCfg 0 0 128 8 100 1 0\nsensorStart"
+    cfg_text = "sensorStop\ndfeDataOutputMode 1\nchannelCfg 15 7 0\nadcCfg 2 0\nadcbufCfg -1 1 1 1 1\nprofileCfg 0 77 429 7 57.14 0 0 70 1 256 5209 0 0 30\nchirpCfg 0 0 0 0 0 0 0 1\nlvdsStreamCfg -1 0 1 0\nframeCfg 0 0 128 8 256 100 1 0\nsensorStart"
     cfg_path = tmp_path / "simple.cfg"
     cfg_path.write_text(cfg_text, encoding="utf-8")
     res = resolve_capture_config(dummy_project, cfg_path, frames=8, guard_frames=1)
@@ -236,7 +237,7 @@ def test_no_sensorStop_sensorStart_in_resolved(dummy_project, tmp_path):
     assert "sensorStart" not in res.resolved_cfg_text
 
 def test_flushCfg_retained_in_resolved(dummy_project, tmp_path):
-    cfg_text = "flushCfg\nchannelCfg 15 7 0\nadcCfg 2 0\nadcbufCfg -1 1 1 1 1\nprofileCfg 0 77 429 7 57.14 0 0 70 1 256 5209 0 0 30\nchirpCfg 0 0 0 0 0 0 0 1\nframeCfg 0 0 128 8 100 1 0"
+    cfg_text = "flushCfg\ndfeDataOutputMode 1\nchannelCfg 15 7 0\nadcCfg 2 0\nadcbufCfg -1 1 1 1 1\nprofileCfg 0 77 429 7 57.14 0 0 70 1 256 5209 0 0 30\nchirpCfg 0 0 0 0 0 0 0 1\nlvdsStreamCfg -1 0 1 0\nframeCfg 0 0 128 8 256 100 1 0"
     cfg_path = tmp_path / "simple.cfg"
     cfg_path.write_text(cfg_text, encoding="utf-8")
     res = resolve_capture_config(dummy_project, cfg_path, frames=8, guard_frames=1)
@@ -244,14 +245,14 @@ def test_flushCfg_retained_in_resolved(dummy_project, tmp_path):
 
 # Frame override 29-30
 def test_frame_override_rewrites_frameCfg(dummy_project, tmp_path):
-    cfg_text = "channelCfg 15 7 0\nadcCfg 2 0\nadcbufCfg -1 1 1 1 1\nprofileCfg 0 77 429 7 57.14 0 0 70 1 256 5209 0 0 30\nchirpCfg 0 0 0 0 0 0 0 1\nframeCfg 0 0 128 8 100 1 0"
+    cfg_text = "dfeDataOutputMode 1\nchannelCfg 15 7 0\nadcCfg 2 0\nadcbufCfg -1 1 1 1 1\nprofileCfg 0 77 429 7 57.14 0 0 70 1 256 5209 0 0 30\nchirpCfg 0 0 0 0 0 0 0 1\nlvdsStreamCfg -1 0 1 0\nframeCfg 0 0 128 8 256 100 1 0"
     cfg_path = tmp_path / "simple.cfg"
     cfg_path.write_text(cfg_text, encoding="utf-8")
     res = resolve_capture_config(dummy_project, cfg_path, frames=16, guard_frames=1)
-    assert "frameCfg 0 0 128 17 100 1 0" in res.resolved_cfg_text
+    assert "frameCfg 0 0 128 17 256 100 1 0" in res.resolved_cfg_text
 
 def test_frame_override_byte_plan_consistency(dummy_project, tmp_path):
-    cfg_text = "channelCfg 15 7 0\nadcCfg 2 0\nadcbufCfg -1 1 1 1 1\nprofileCfg 0 77 429 7 57.14 0 0 70 1 256 5209 0 0 30\nchirpCfg 0 0 0 0 0 0 0 1\nframeCfg 0 0 128 8 100 1 0"
+    cfg_text = "dfeDataOutputMode 1\nchannelCfg 15 7 0\nadcCfg 2 0\nadcbufCfg -1 1 1 1 1\nprofileCfg 0 77 429 7 57.14 0 0 70 1 256 5209 0 0 30\nchirpCfg 0 0 0 0 0 0 0 1\nlvdsStreamCfg -1 0 1 0\nframeCfg 0 0 128 8 256 100 1 0"
     cfg_path = tmp_path / "simple.cfg"
     cfg_path.write_text(cfg_text, encoding="utf-8")
     res = resolve_capture_config(dummy_project, cfg_path, frames=16, guard_frames=1)
@@ -403,7 +404,7 @@ def test_frame_resolution_radar_profile(tmp_path, dummy_project):
 
 def test_frame_resolution_cfg(tmp_path, dummy_project):
     from awr2944_dca.api._config_resolver import resolve_capture_config
-    cfg_text = "channelCfg 15 7 0\nadcCfg 2 0\nadcbufCfg -1 1 1 1 1\nprofileCfg 0 77 429 7 57.14 0 0 70 1 256 5209 0 0 30\nchirpCfg 0 0 0 0 0 0 0 1\nframeCfg 0 0 128 8 100 1 0\n"
+    cfg_text = "dfeDataOutputMode 1\nchannelCfg 15 7 0\nadcCfg 2 0\nadcbufCfg -1 1 1 1 1\nprofileCfg 0 77 429 7 57.14 0 0 70 1 256 5209 0 0 30\nchirpCfg 0 0 0 0 0 0 0 1\nlvdsStreamCfg -1 0 1 0\nframeCfg 0 0 128 8 256 100 1 0\n"
     cfg_path = tmp_path / "test.cfg"
     cfg_path.write_text(cfg_text)
     

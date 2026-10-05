@@ -31,22 +31,23 @@ COMMON = (
     "channelCfg 15 7 0\n"
     "adcCfg 2 0\n"
     "adcbufCfg -1 1 1 1 1\n"
+    "lvdsStreamCfg -1 0 1 0\n"
     "profileCfg 0 77 429 7 57.14 0 0 70 1 256 5209 0 0 30\n"
 )
-SINGLE_CFG = COMMON + "chirpCfg 0 0 0 0 0 0 0 1\nframeCfg 0 0 128 8 100 1 0\nsensorStart\n"
+SINGLE_CFG = COMMON + "chirpCfg 0 0 0 0 0 0 0 1\nframeCfg 0 0 128 8 256 100 1 0\nsensorStart\n"
 TDM2_CFG = (
     COMMON
-    + "chirpCfg 0 0 0 0 0 0 0 1\nchirpCfg 1 1 0 0 0 0 0 2\nframeCfg 0 1 64 8 100 1 0\n"
+    + "chirpCfg 0 0 0 0 0 0 0 1\nchirpCfg 1 1 0 0 0 0 0 2\nframeCfg 0 1 64 8 256 100 1 0\n"
 )
 TDM3_CFG = (
     COMMON
     + "chirpCfg 0 0 0 0 0 0 0 1\nchirpCfg 1 1 0 0 0 0 0 4\nchirpCfg 2 2 0 0 0 0 0 2\n"
-    + "frameCfg 0 2 32 8 100 1 0\n"
+    + "frameCfg 0 2 32 8 256 100 1 0\n"
 )
 # Second chirp references a profileId that does not exist -> samples/chirp unprovable.
 BAD_RAW_CFG = (
     COMMON
-    + "chirpCfg 0 0 0 0 0 0 0 1\nchirpCfg 1 1 1 0 0 0 0 2\nframeCfg 0 1 64 8 100 1 0\n"
+    + "chirpCfg 0 0 0 0 0 0 0 1\nchirpCfg 1 1 1 0 0 0 0 2\nframeCfg 0 1 64 8 256 100 1 0\n"
 )
 
 SMOKE_GOLDEN_CLI = (
@@ -175,7 +176,7 @@ def test_single_chirp_cfg_regression(project, tmp_path):
     assert res.capabilities.can_build_legacy_dsp_profile
     assert res.capabilities.can_execute_live
     assert res.capabilities.live_block_reason is None
-    assert "frameCfg 0 0 128 9 100 1 0" in res.resolved_cfg_text
+    assert "frameCfg 0 0 128 9 256 100 1 0" in res.resolved_cfg_text
 
 
 # 3. 2-TX TDM -----------------------------------------------------------------
@@ -224,7 +225,7 @@ def test_tdm_never_fakes_a_dsp_profile(project, tmp_path):
 def test_byte_plan_equivalence_single_vs_tdm(project, tmp_path):
     single = resolve_capture_config(
         project,
-        _cfg(tmp_path, COMMON + "chirpCfg 0 0 0 0 0 0 0 1\nframeCfg 0 0 128 8 100 1 0\n", "a.cfg"),
+        _cfg(tmp_path, COMMON + "chirpCfg 0 0 0 0 0 0 0 1\nframeCfg 0 0 128 8 256 100 1 0\n", "a.cfg"),
         frames=8, guard_frames=1,
     )
     tdm = resolve_capture_config(project, _cfg(tmp_path, TDM2_CFG, "b.cfg"), frames=8, guard_frames=1)
@@ -242,27 +243,27 @@ def test_schedule_frame_count_tracks_native_frames(project, tmp_path):
 
 # 6. missing chirp failure -----------------------------------------------------
 def test_missing_chirp_definition_fails_resolution(project, tmp_path):
-    text = COMMON + "chirpCfg 0 0 0 0 0 0 0 1\nframeCfg 0 1 64 8 100 1 0\n"
+    text = COMMON + "chirpCfg 0 0 0 0 0 0 0 1\nframeCfg 0 1 64 8 256 100 1 0\n"
     with pytest.raises(ValueError, match="no chirpCfg defines it"):
         resolve_capture_config(project, _cfg(tmp_path, text), frames=8, guard_frames=1)
 
 
 def test_invalid_frame_range_fails_resolution(project, tmp_path):
-    text = COMMON + "chirpCfg 0 1 0 0 0 0 0 1\nframeCfg 1 0 64 8 100 1 0\n"
+    text = COMMON + "chirpCfg 0 1 0 0 0 0 0 1\nframeCfg 1 0 64 8 256 100 1 0\n"
     with pytest.raises(ValueError, match="Invalid frame chirp range"):
         resolve_capture_config(project, _cfg(tmp_path, text), frames=8, guard_frames=1)
 
 
 def test_overlapping_chirpcfg_fails_resolution(project, tmp_path):
     text = (
-        COMMON + "chirpCfg 0 1 0 0 0 0 0 1\nchirpCfg 1 1 0 0 0 0 0 2\nframeCfg 0 1 64 8 100 1 0\n"
+        COMMON + "chirpCfg 0 1 0 0 0 0 0 1\nchirpCfg 1 1 0 0 0 0 0 2\nframeCfg 0 1 64 8 256 100 1 0\n"
     )
     with pytest.raises(ValueError, match="overlapping"):
         resolve_capture_config(project, _cfg(tmp_path, text), frames=8, guard_frames=1)
 
 
 def test_preflight_reports_schedule_error(tmp_path):
-    cfg = MmwDemoConfig.from_cfg_text(COMMON + "chirpCfg 0 0 0 0 0 0 0 1\nframeCfg 0 1 64 8 100 1 0\n")
+    cfg = MmwDemoConfig.from_cfg_text(COMMON + "chirpCfg 0 0 0 0 0 0 0 1\nframeCfg 0 1 64 8 256 100 1 0\n")
     issues = preflight_validate(cfg, extract_capture_metadata(cfg))
     assert any(i.severity == "ERROR" and "Invalid chirp schedule" in i.message for i in issues)
 

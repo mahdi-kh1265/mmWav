@@ -99,6 +99,75 @@ class ValidationIssue:
     message: str
 
 
+# TI AWR294x CLI handlers check argc (including the command name):
+#   profileCfg argc==15, frameCfg argc==9, channelCfg argc==4, adcCfg argc==3,
+#   adcbufCfg 5 args (+optional subframe), lvdsStreamCfg 4 args (+optional subframe).
+_EXACT_ARG_COUNTS = {
+    "profileCfg": 14,
+    "frameCfg": 8,
+    "channelCfg": 3,
+    "adcCfg": 2,
+    "adcbufCfg": 5,
+    "lvdsStreamCfg": 4,
+}
+
+# RX layout policy for live raw capture.
+# Proven from SDK source (cbuff_transfer.c CBUFF_setupNonInterleaved_ADC): active RX channels
+# are streamed in ascending physical index order, one adcTransferSize block per RX, so
+# native bytes scale linearly with the number of active RX.  Only 4 RX (0b1111) has been
+# verified on hardware in this repository.
+HARDWARE_VERIFIED_RX_MASKS = frozenset({0b1111})
+# Two-RX masks follow the same SDK-proven layout but are NOT hardware verified (allowed with
+# an explicit warning).  1 RX (Studio requires a single lane, demo is fixed at 2 lanes) and
+# 3 RX (not a documented AWR2944 LVDS mode) fail closed.
+UNVERIFIED_RX_MASKS = frozenset({0b0011, 0b0101, 0b0110, 0b1001, 0b1010, 0b1100})
+
+
+def active_rx_channels(rx_mask: int) -> tuple[int, ...]:
+    """Physical RX indices in the order the raw stream carries them (ascending)."""
+    return tuple(i for i in range(4) if (rx_mask >> i) & 1)
+
+
+def _stream_cfg_block(cfg: Optional[MmwDemoConfig]) -> Optional[str]:
+    """Config-level gates that change the raw LVDS byte layout (SDK mmw_cli.c /
+    mmw_lvds_stream.c).  Returns a reason or None."""
+    if cfg is None:
+        return None
+    lines = [l for l in cfg.lines if l.is_command]
+    lvds = [l for l in lines if l.command == "lvdsStreamCfg"]
+    if len(lvds) != 1:
+        return (
+            "exactly one 'lvdsStreamCfg' is required for raw capture (found "
+            f"{len(lvds)}); add 'lvdsStreamCfg -1 0 1 0' (no HSI header, ADC data, no SW session)."
+        )
+    a = list(lvds[0].args)
+    if len(a) != 4 or a[0] not in ("-1", "0") or a[1:] != ["0", "1", "0"]:
+        return (
+            f"lvdsStreamCfg {' '.join(a)} changes the stream layout: raw capture requires "
+            "isHeaderEnabled=0, dataFmt=1 (ADC), isSwEnabled=0 ('lvdsStreamCfg -1 0 1 0')."
+        )
+    adcbuf = [l for l in lines if l.command == "adcbufCfg"]
+    if len(adcbuf) != 1:
+        return f"exactly one 'adcbufCfg' is required (found {len(adcbuf)})."
+    b = list(adcbuf[0].args)
+    if len(b) != 5 or b[0] not in ("-1", "0"):
+        return "adcbufCfg must be a single global/sub-frame-0 command with 5 arguments."
+    if b[3] != "1":
+        return (
+            f"adcbufCfg chInterleave={b[3]}: only non-interleaved (1) has a known RX layout "
+            "(CBUFF non-interleaved: one contiguous block per RX)."
+        )
+    if b[4] != "1":
+        return "adcbufCfg chirpThreshold must be 1 (demo firmware rejects other values)."
+    frame = [l for l in lines if l.command == "frameCfg"]
+    if len(frame) == 1 and len(frame[0].args) == 8 and frame[0].args[6] != "1":
+        return (
+            f"frameCfg triggerSelect={frame[0].args[6]}: only software trigger (1) is supported; "
+            "hardware trigger would wait for an external pulse."
+        )
+    return None
+
+
 @dataclass(frozen=True)
 class ResolvedCaptureConfig:
     """Immutable resolved configuration ready for capture execution."""
@@ -239,6 +308,32 @@ def preflight_validate(cfg: MmwDemoConfig, meta: CfgCaptureMetadata) -> list[Val
     unknown = [line.command for line in cfg.lines if line.is_command and line.command not in KNOWN_COMMANDS]
     if unknown:
         issues.append(ValidationIssue("ERROR", f"Unknown commands cannot be transmitted: {unknown}"))
+
+    # Firmware-accurate argument counts (TI cli_mmwave.c: argc includes the command
+    # name).  Commands the firmware would reject must never reach the radar.
+    for cmd, want in _EXACT_ARG_COUNTS.items():
+        for line in cfg.lines:
+            if line.is_command and line.command == cmd and len(line.args) != want:
+                issues.append(ValidationIssue(
+                    "ERROR",
+                    f"{cmd} requires exactly {want} arguments on AWR294x, got {len(line.args)}.",
+                ))
+
+    dfe_cmds = [line for line in cfg.lines if line.is_command and line.command == "dfeDataOutputMode"]
+    if len(dfe_cmds) != 1 or list(dfe_cmds[0].args[:1]) != ["1"]:
+        issues.append(ValidationIssue(
+            "ERROR",
+            "dfeDataOutputMode must be present exactly once and equal 1 (legacy frame mode).",
+        ))
+
+    if meta.num_loops < 1 or meta.num_loops > 255:
+        issues.append(ValidationIssue(
+            "ERROR", f"frameCfg numLoops {meta.num_loops} outside firmware range 1..255."
+        ))
+    if meta.num_frames > 65535:
+        issues.append(ValidationIssue(
+            "ERROR", f"frameCfg numFrames {meta.num_frames} exceeds firmware maximum 65535."
+        ))
         
     prof_cmds = [line for line in cfg.lines if line.command == "profileCfg"]
     if len(prof_cmds) > 1:
@@ -368,6 +463,7 @@ def raw_capture_block_reason(
     meta: CfgCaptureMetadata,
     schedule: Optional[BasicFrameSchedule],
     profile_id: int = 0,
+    cfg: Optional[MmwDemoConfig] = None,
 ) -> Optional[str]:
     """Why raw ADC capture cannot be executed live for this basic-frame config.
 
@@ -393,10 +489,27 @@ def raw_capture_block_reason(
             )
     if meta.rx_count < 1 or meta.adc_samples < 1:
         return block + "invalid RX count / sample count."
+    if meta.rx_mask < 1 or meta.rx_mask > 0xF:
+        return block + f"channelCfg rxChannelEn {meta.rx_mask} outside 0x1..0xF."
+    if meta.rx_mask not in HARDWARE_VERIFIED_RX_MASKS and meta.rx_mask not in UNVERIFIED_RX_MASKS:
+        return block + (
+            f"RX mask 0b{meta.rx_mask:04b} ({meta.rx_count} RX) is not a supported raw-stream mode: "
+            "1-RX (needs a single LVDS lane; demo is fixed at 2 lanes) and 3-RX (not a documented "
+            "AWR2944 LVDS mode) fail closed.  Use 4 RX (0b1111) or 2 RX."
+        )
+    if meta.adc_samples % 2 != 0:
+        return block + (
+            f"odd numAdcSamples ({meta.adc_samples}): samples are striped over 2 LVDS lanes, "
+            "layout unproven."
+        )
     if meta.bytes_per_adc_sample != 2 or meta.is_complex:
         return block + "only real int16 ADC data has a known byte layout."
     if schedule.physical_chirps_per_frame < 1:
         return block + "physical chirp count is not positive."
+    if cfg is not None:
+        stream = _stream_cfg_block(cfg)
+        if stream:
+            return block + stream
     return None
 
 
@@ -487,6 +600,19 @@ def _make_byte_plan(
         canonical_dca_bytes=sbp.canonical_dca_bytes,
     )
 
+def _structured_raw_block(effective_profile: Any) -> Optional[str]:
+    """RX-mask gate for the structured (TOML/RadarProfile) path; the SDK CLI it emits is fixed."""
+    mask = effective_profile.channel.rx_mask
+    if mask not in HARDWARE_VERIFIED_RX_MASKS and mask not in UNVERIFIED_RX_MASKS:
+        return (
+            f"Raw capture is not enabled: RX mask 0b{mask:04b} is not a supported raw-stream mode "
+            "(use 4 RX or 2 RX)."
+        )
+    if effective_profile.sampling.samples % 2 != 0:
+        return "Raw capture is not enabled: odd numAdcSamples layout is unproven."
+    return None
+
+
 def resolve_capture_config(
     project: Any,
     profile: Any,
@@ -563,10 +689,13 @@ def resolve_capture_config(
             derived={},
             preflight_warnings=[],
             schedule=schedule,
-            capabilities=_build_capabilities(schedule, dsp_profile),
+            capabilities=_build_capabilities(
+                schedule, dsp_profile, None, _structured_raw_block(effective_profile)
+            ),
             capture_layout=build_capture_layout(
                 schedule, rx_channels, profile.sampling.samples, canonical_frames,
                 guard_frames, requires_schedule_aware_dsp=dsp_profile is None,
+                rx_mask=effective_profile.channel.rx_mask,
             ),
         )
         
@@ -590,14 +719,33 @@ def resolve_capture_config(
             source_kind = "mmw_demo_config"
             
         # Pre-extract to find native num_frames if frames is None
-        temp_meta = extract_capture_metadata(cfg)
+        try:
+            temp_meta = extract_capture_metadata(cfg)
+        except (ValueError, IndexError) as exc:
+            raise ValueError(f"Invalid or malformed configuration values: {exc}") from exc
+        extra_warnings: List[str] = []
+        if temp_meta.num_frames < 0:
+            raise ValueError(f"frameCfg numFrames {temp_meta.num_frames} is negative.")
+        if temp_meta.num_frames == 0:
+            # TI: numFrames=0 means INFINITE frames.  A finite byte-target capture
+            # cannot be derived from it.
+            if frames is None:
+                raise ValueError(
+                    "frameCfg numFrames=0 means INFINITE frames on TI firmware; a finite byte-target "
+                    "capture needs an explicit frame count (pass frames=N)."
+                )
+            extra_warnings.append(
+                "cfg frameCfg numFrames=0 (infinite) was overridden by an explicit finite frame count."
+            )
         canonical_frames = frames if frames is not None else temp_meta.num_frames
+        if canonical_frames < 1:
+            raise ValueError(f"Canonical frame count must be >= 1, got {canonical_frames}.")
         resolved_frames = canonical_frames + guard_frames
         
-        # Rewrite frameCfg numFrames to resolved native total before final extraction
+        # Rewrite ONLY frameCfg numFrames (arg index 3) to the resolved native total.
         new_lines = []
         for line in cfg.lines:
-            if line.is_command and line.command == "frameCfg" and len(line.args) >= 7:
+            if line.is_command and line.command == "frameCfg" and len(line.args) == 8:
                 args = list(line.args)
                 args[3] = str(resolved_frames)
                 new_lines.append(f"frameCfg {' '.join(args)}")
@@ -613,7 +761,12 @@ def resolve_capture_config(
         if errors:
             raise ValueError(f"Preflight validation failed: {errors}")
             
-        warnings = [i.message for i in issues if i.severity == "WARNING"]
+        warnings = [i.message for i in issues if i.severity == "WARNING"] + extra_warnings
+        if meta.rx_mask in UNVERIFIED_RX_MASKS:
+            warnings.append(
+                f"RX mask 0b{meta.rx_mask:04b} ({meta.rx_count} RX) is not hardware-verified in this "
+                "repository; only 4-RX (0b1111) captures have been validated on hardware."
+            )
         
         cli_commands = build_cli_commands(cfg, num_frames_override=None)
         try:
@@ -628,7 +781,7 @@ def resolve_capture_config(
         profile_id = int(prof_cmd.args[0]) if prof_cmd and prof_cmd.args else 0
         dsp_block = legacy_dsp_block_reason(meta, schedule, profile_id)
         dsp_profile = build_dsp_profile(meta, schedule, profile_id)
-        raw_block = raw_capture_block_reason(meta, schedule, profile_id)
+        raw_block = raw_capture_block_reason(meta, schedule, profile_id, cfg=cfg)
         
         # preflight_validate has already rejected complex ADC formats, so the
         # real-int16 schedule byte plan applies.
@@ -656,6 +809,7 @@ def resolve_capture_config(
             capture_layout=build_capture_layout(
                 schedule, meta.rx_count, meta.adc_samples, canonical_frames,
                 guard_frames, requires_schedule_aware_dsp=dsp_profile is None,
+                rx_mask=meta.rx_mask,
             ),
         )
         

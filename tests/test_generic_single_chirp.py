@@ -65,9 +65,10 @@ def test_baseline_generic_cfg_is_live_and_mapped(project, tmp_path):
     assert r.byte_plan.canonical_dca_bytes == 4_194_304
 
 
-def test_seven_arg_framecfg_period(project, tmp_path):
-    r = res_for(project, tmp_path, make_cfg(frame_args8=False, period=50))
-    assert r.dsp_profile.frame_period_s == pytest.approx(50e-3)
+def test_seven_arg_framecfg_rejected(project, tmp_path):
+    # TI cli_mmwave.c requires argc==9 (8 args) for frameCfg on AWR294x.
+    with pytest.raises(ValueError, match='exactly 8 arguments'):
+        res_for(project, tmp_path, make_cfg(frame_args8=False, period=50))
 
 
 def test_frequency_and_slope(project, tmp_path):
